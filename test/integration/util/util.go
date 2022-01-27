@@ -44,6 +44,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	pvutil "k8s.io/component-helpers/storage/volume"
 	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kube-scheduler/config/v1beta3"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
@@ -67,8 +68,9 @@ type ShutdownFunc func()
 
 // StartScheduler configures and starts a scheduler given a handle to the clientSet interface
 // and event broadcaster. It returns the running scheduler, podInformer and the shutdown function to stop it.
-func StartScheduler(clientSet clientset.Interface, kubeConfig *restclient.Config, cfg *kubeschedulerconfig.KubeSchedulerConfiguration) (*scheduler.Scheduler, coreinformers.PodInformer, ShutdownFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+func StartScheduler(tl ktesting.TL, clientSet clientset.Interface, kubeConfig *restclient.Config, cfg *kubeschedulerconfig.KubeSchedulerConfiguration) (*scheduler.Scheduler, coreinformers.PodInformer, ShutdownFunc) {
+	_, ctx := ktesting.NewTestContext(tl)
+	ctx, cancel := context.WithCancel(ctx)
 
 	informerFactory := scheduler.NewInformerFactory(clientSet, 0)
 	evtBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{
@@ -77,11 +79,11 @@ func StartScheduler(clientSet clientset.Interface, kubeConfig *restclient.Config
 	evtBroadcaster.StartRecordingToSink(ctx.Done())
 
 	sched, err := scheduler.New(
+		ctx,
 		clientSet,
 		informerFactory,
 		nil,
 		profile.NewRecorderFactory(evtBroadcaster),
-		ctx.Done(),
 		scheduler.WithKubeConfig(kubeConfig),
 		scheduler.WithProfiles(cfg.Profiles...),
 		scheduler.WithPercentageOfNodesToScore(cfg.PercentageOfNodesToScore),
@@ -409,11 +411,11 @@ func InitTestSchedulerWithOptions(
 
 	opts = append(opts, scheduler.WithKubeConfig(testCtx.KubeConfig))
 	testCtx.Scheduler, err = scheduler.New(
+		testCtx.Ctx,
 		testCtx.ClientSet,
 		testCtx.InformerFactory,
 		testCtx.DynInformerFactory,
 		profile.NewRecorderFactory(eventBroadcaster),
-		testCtx.Ctx.Done(),
 		opts...,
 	)
 
