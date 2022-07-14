@@ -415,7 +415,7 @@ func TestSchedulerMultipleProfilesScheduling(t *testing.T) {
 		return true, binding, nil
 	})
 	controllers := make(map[string]string)
-	stopFn := broadcaster.StartEventWatcher(func(obj runtime.Object) {
+	stopFn, err := broadcaster.StartEventWatcher(func(obj runtime.Object) {
 		e, ok := obj.(*eventsv1.Event)
 		if !ok || e.Reason != "Scheduled" {
 			return
@@ -423,6 +423,9 @@ func TestSchedulerMultipleProfilesScheduling(t *testing.T) {
 		controllers[e.Regarding.Name] = e.ReportingController
 		wg.Done()
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer stopFn()
 
 	// Run scheduler.
@@ -606,13 +609,16 @@ func TestSchedulerScheduleOne(t *testing.T) {
 				return item.mockResult.result, item.mockResult.err
 			}
 			called := make(chan struct{})
-			stopFunc := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
+			stopFunc, err := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
 				e, _ := obj.(*eventsv1.Event)
 				if e.Reason != item.eventReason {
 					t.Errorf("got event %v, want %v", e.Reason, item.eventReason)
 				}
 				close(called)
 			})
+			if err != nil {
+				t.Fatal(err)
+			}
 			sched.scheduleOne(ctx)
 			<-called
 			if e, a := item.expectAssumedPod, gotAssumedPod; !reflect.DeepEqual(e, a) {
@@ -952,13 +958,16 @@ func TestSchedulerWithVolumeBinding(t *testing.T) {
 			fakeVolumeBinder := volumebinding.NewFakeVolumeBinder(item.volumeBinderConfig)
 			s, bindingChan, errChan := setupTestSchedulerWithVolumeBinding(ctx, t, fakeVolumeBinder, eventBroadcaster)
 			eventChan := make(chan struct{})
-			stopFunc := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
+			stopFunc, err := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
 				e, _ := obj.(*eventsv1.Event)
 				if e, a := item.eventReason, e.Reason; e != a {
 					t.Errorf("expected %v, got %v", e, a)
 				}
 				close(eventChan)
 			})
+			if err != nil {
+				t.Fatal(err)
+			}
 			s.scheduleOne(ctx)
 			// Wait for pod to succeed or fail scheduling
 			select {
