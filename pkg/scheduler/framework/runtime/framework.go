@@ -548,7 +548,7 @@ func fillEventToPluginMap(logger klog.Logger, p framework.Plugin, eventToPlugins
 	// We treat it as: the plugin is not interested in any event, and hence pod failed by that plugin
 	// cannot be moved by any regular cluster event.
 	if len(events) == 0 {
-		logger.Info("Plugin's EventsToRegister() returned nil")
+		logger.Info("Plugin's EventsToRegister() returned nil", "plugin", p.Name())
 		return
 	}
 	// The most common case: a plugin implements EnqueueExtensions and returns non-nil result.
@@ -625,6 +625,15 @@ func (f *frameworkImpl) RunPreFilterPlugins(ctx context.Context, state *framewor
 	var pluginsWithNodes []string
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "PreFilter")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	for _, pl := range f.preFilterPlugins {
 		logger := klog.LoggerWithName(logger, pl.Name())
@@ -675,7 +684,16 @@ func (f *frameworkImpl) RunPreFilterExtensionAddPod(
 ) (status *framework.Status) {
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "AddPod")
-	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()))
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter")
 	for _, pl := range f.preFilterPlugins {
 		if pl.PreFilterExtensions() == nil {
 			continue
@@ -685,7 +703,7 @@ func (f *frameworkImpl) RunPreFilterExtensionAddPod(
 		status = f.runPreFilterExtensionAddPod(ctx, pl, state, podToSchedule, podInfoToAdd, nodeInfo)
 		if !status.IsSuccess() {
 			err := status.AsError()
-			logger.Error(err, "Plugin failed")
+			logger.Error(err, "Plugin failed", "pod", klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter", "extension", "AddPod", "plugin", pl.Name())
 			return framework.AsStatus(fmt.Errorf("running AddPod on PreFilter plugin %q: %w", pl.Name(), err))
 		}
 	}
@@ -715,7 +733,16 @@ func (f *frameworkImpl) RunPreFilterExtensionRemovePod(
 ) (status *framework.Status) {
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "RemovePod")
-	logger = klog.LoggerWithValues(logger, klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()))
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter")
 	for _, pl := range f.preFilterPlugins {
 		if pl.PreFilterExtensions() == nil {
 			continue
@@ -725,7 +752,7 @@ func (f *frameworkImpl) RunPreFilterExtensionRemovePod(
 		status = f.runPreFilterExtensionRemovePod(ctx, pl, state, podToSchedule, podInfoToRemove, nodeInfo)
 		if !status.IsSuccess() {
 			err := status.AsError()
-			logger.Error(err, "Plugin failed")
+			logger.Error(err, "Plugin failed", "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter", "extension", "RemovePod", "plugin", pl.Name())
 			return framework.AsStatus(fmt.Errorf("running RemovePod on PreFilter plugin %q: %w", pl.Name(), err))
 		}
 	}
@@ -756,6 +783,15 @@ func (f *frameworkImpl) RunFilterPlugins(
 	var status *framework.Status
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "Filter")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.KObj(nodeInfo.Node()))
 
 	for _, pl := range f.filterPlugins {
@@ -795,6 +831,15 @@ func (f *frameworkImpl) RunPostFilterPlugins(ctx context.Context, state *framewo
 	}()
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "PostFilter")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	statuses := make(framework.PluginToStatus)
 	// `result` records the last meaningful(non-noop) PostFilterResult.
@@ -927,6 +972,15 @@ func (f *frameworkImpl) RunPreScorePlugins(
 	}()
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "PreScore")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	for _, pl := range f.preScorePlugins {
 		logger := klog.LoggerWithName(logger, pl.Name())
@@ -971,6 +1025,15 @@ func (f *frameworkImpl) RunScorePlugins(ctx context.Context, state *framework.Cy
 	// Run Score method for each node in parallel.
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "Score")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	f.Parallelizer().Until(ctx, len(nodes), func(index int) {
 		nodeName := nodes[index].Name
@@ -1076,6 +1139,15 @@ func (f *frameworkImpl) RunPreBindPlugins(ctx context.Context, state *framework.
 	}()
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "PreBind")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	logger = klog.LoggerWithValues(logger, "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.preBindPlugins {
@@ -1089,7 +1161,7 @@ func (f *frameworkImpl) RunPreBindPlugins(ctx context.Context, state *framework.
 				return status
 			}
 			err := status.AsError()
-			logger.Error(err, "Failed running PreBind plugin", "plugin", pl.Name(), "pod", klog.KObj(pod), "node", nodeName)
+			logger.Error(err, "Failed running PreBind plugin", "plugin", pl.Name(), "pod", klog.KObj(pod), "node", nodeName, "extensibleAPI", "PreBind")
 			return framework.AsStatus(fmt.Errorf("running PreBind plugin %q: %w", pl.Name(), err))
 		}
 	}
@@ -1117,6 +1189,15 @@ func (f *frameworkImpl) RunBindPlugins(ctx context.Context, state *framework.Cyc
 	}
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "Bind")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, bp := range f.bindPlugins {
 		logger := klog.LoggerWithName(logger, bp.Name())
@@ -1158,6 +1239,15 @@ func (f *frameworkImpl) RunPostBindPlugins(ctx context.Context, state *framework
 	}()
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "PostBind")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.postBindPlugins {
 		logger := klog.LoggerWithName(logger, pl.Name())
@@ -1188,6 +1278,15 @@ func (f *frameworkImpl) RunReservePluginsReserve(ctx context.Context, state *fra
 	}()
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "Reserve")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.reservePlugins {
 		logger := klog.LoggerWithName(logger, pl.Name())
@@ -1223,6 +1322,15 @@ func (f *frameworkImpl) RunReservePluginsUnreserve(ctx context.Context, state *f
 	// *reverse* order in which the Reserve operation was executed.
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "Unreserve")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for i := len(f.reservePlugins) - 1; i >= 0; i-- {
 		logger := klog.LoggerWithName(logger, f.reservePlugins[i].Name())
@@ -1256,6 +1364,15 @@ func (f *frameworkImpl) RunPermitPlugins(ctx context.Context, state *framework.C
 	statusCode := framework.Success
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "Permit")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.permitPlugins {
 		logger := klog.LoggerWithName(logger, pl.Name())
