@@ -1537,7 +1537,7 @@ profiles:
 				}
 			}
 			// create the config
-			config, err := tc.options.Config()
+			config, err := tc.options.Config(context.Background())
 
 			// handle errors
 			if err != nil {

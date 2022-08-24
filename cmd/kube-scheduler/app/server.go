@@ -318,7 +318,7 @@ func Setup(ctx context.Context, opts *options.Options, outOfTreeRegistryOptions 
 		return nil, nil, utilerrors.NewAggregate(errs)
 	}
 
-	c, err := opts.Config()
+	c, err := opts.Config(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -31,16 +31,16 @@ import (
 	configv1beta3 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1beta3"
 )
 
-func loadConfigFromFile(file string) (*config.KubeSchedulerConfiguration, error) {
+func loadConfigFromFile(logger klog.Logger, file string) (*config.KubeSchedulerConfiguration, error) {
 	data, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
 
-	return loadConfig(data)
+	return loadConfig(logger, data)
 }
 
-func loadConfig(data []byte) (*config.KubeSchedulerConfiguration, error) {
+func loadConfig(logger klog.Logger, data []byte) (*config.KubeSchedulerConfiguration, error) {
 	// The UniversalDecoder runs defaulting and returns the internal type by default.
 	obj, gvk, err := scheme.Codecs.UniversalDecoder().Decode(data, nil, nil)
 	if err != nil {
