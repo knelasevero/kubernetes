@@ -2799,3 +2799,33 @@ func mustNewPodInfo(t *testing.T, pod *v1.Pod) *framework.PodInfo {
 	}
 	return podInfo
 }
+
+func BenchmarkRunPreFilterPlugins(b *testing.B) {
+	preFilter1 := &TestPreFilterPlugin{}
+	preFilter2 := &TestPreFilterWithExtensionsPlugin{}
+	r := make(Registry)
+	r.Register(preFilterPluginName,
+		func(_ runtime.Object, fh framework.Handle) (framework.Plugin, error) {
+			return preFilter1, nil
+		})
+	r.Register(preFilterWithExtensionsPluginName,
+		func(_ runtime.Object, fh framework.Handle) (framework.Plugin, error) {
+			return preFilter2, nil
+		})
+	plugins := &config.Plugins{PreFilter: config.PluginSet{Enabled: []config.Plugin{{Name: preFilterWithExtensionsPluginName}, {Name: preFilterPluginName}}}}
+	b.Run(fmt.Sprintf("BenchmarkRunPreFilterPlugins"), func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			profile := config.KubeSchedulerProfile{Plugins: plugins}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			f, err := newFrameworkWithQueueSortAndBind(r, profile, ctx.Done())
+			if err != nil {
+				b.Fatalf("Failed to create framework for testing: %v", err)
+			}
+			f.RunPreFilterPlugins(ctx, nil, nil)
+			f.RunPreFilterExtensionAddPod(ctx, nil, nil, nil, nil)
+			f.RunPreFilterExtensionRemovePod(ctx, nil, nil, nil, nil)
+		}
+	})
+}
