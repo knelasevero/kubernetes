@@ -24,9 +24,6 @@ import (
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 )
 
-// resourceToWeightMap contains resource name and weight.
-type resourceToWeightMap map[v1.ResourceName]int64
-
 // scorer is decorator for resourceAllocationScorer
 type scorer func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer
 
@@ -35,39 +32,40 @@ type resourceAllocationScorer struct {
 	Name string
 	// used to decide whether to use Requested or NonZeroRequested for
 	// cpu and memory.
-	useRequested        bool
-	scorer              func(requested, allocable resourceToValueMap) int64
-	resourceToWeightMap resourceToWeightMap
+	useRequested bool
+	scorer       func(requested, allocable []int64) int64
+	resources    []config.ResourceSpec
 }
-
-// resourceToValueMap is keyed with resource name and valued with quantity.
-type resourceToValueMap map[v1.ResourceName]int64
 
 // score will use `scorer` function to calculate the score.
 func (r *resourceAllocationScorer) score(
+	logger klog.Logger,
 	pod *v1.Pod,
 	nodeInfo *framework.NodeInfo) (int64, *framework.Status) {
 	node := nodeInfo.Node()
 	if node == nil {
 		return 0, framework.NewStatus(framework.Error, "node not found")
 	}
-	if r.resourceToWeightMap == nil {
+	// resources not set, nothing scheduled,
+	if len(r.resources) == 0 {
 		return 0, framework.NewStatus(framework.Error, "resources not found")
 	}
 
-	requested := make(resourceToValueMap)
-	allocatable := make(resourceToValueMap)
-	for resource := range r.resourceToWeightMap {
-		alloc, req := r.calculateResourceAllocatableRequest(nodeInfo, pod, resource)
-		if alloc != 0 {
-			// Only fill the extended resource entry when it's non-zero.
-			allocatable[resource], requested[resource] = alloc, req
+	requested := make([]int64, len(r.resources))
+	allocatable := make([]int64, len(r.resources))
+	for i := range r.resources {
+		alloc, req := r.calculateResourceAllocatableRequest(logger, nodeInfo, pod, v1.ResourceName(r.resources[i].Name))
+		// Only fill the extended resource entry when it's non-zero.
+		if alloc == 0 {
+			continue
 		}
+		allocatable[i] = alloc
+		requested[i] = req
 	}
 
 	score := r.scorer(requested, allocatable)
 
-	klog.V(10).InfoS("Listing internal info for allocatable resources, requested resources and score", "pod",
+	logger.V(10).Info("Listing internal info for allocatable resources, requested resources and score", "pod",
 		klog.KObj(pod), "node", klog.KObj(node), "resourceAllocationScorer", r.Name,
 		"allocatableResource", allocatable, "requestedResource", requested, "resourceScore", score,
 	)
@@ -79,7 +77,7 @@ func (r *resourceAllocationScorer) score(
 // - 1st param: quantity of allocatable resource on the node.
 // - 2nd param: aggregated quantity of requested resource on the node.
 // Note: if it's an extended resource, and the pod doesn't request it, (0, 0) is returned.
-func (r *resourceAllocationScorer) calculateResourceAllocatableRequest(nodeInfo *framework.NodeInfo, pod *v1.Pod, resource v1.ResourceName) (int64, int64) {
+func (r *resourceAllocationScorer) calculateResourceAllocatableRequest(logger klog.Logger, nodeInfo *framework.NodeInfo, pod *v1.Pod, resource v1.ResourceName) (int64, int64) {
 	requested := nodeInfo.NonZeroRequested
 	if r.useRequested {
 		requested = nodeInfo.Requested
@@ -103,12 +101,12 @@ func (r *resourceAllocationScorer) calculateResourceAllocatableRequest(nodeInfo 
 			return nodeInfo.Allocatable.ScalarResources[resource], (nodeInfo.Requested.ScalarResources[resource] + podRequest)
 		}
 	}
-	klog.V(10).InfoS("Requested resource is omitted for node score calculation", "resourceName", resource)
+	logger.V(10).Info("Requested resource is omitted for node score calculation", "resourceName", resource)
 	return 0, 0
 }
 
-// calculatePodResourceRequest returns the total non-zero requests. If Overhead is defined for the pod and the
-// PodOverhead feature is enabled, the Overhead is added to the result.
+// calculatePodResourceRequest returns the total non-zero requests. If Overhead is defined for the pod
+// the Overhead is added to the result.
 // podResourceRequest = max(sum(podSpec.Containers), podSpec.InitContainers) + overHead
 func (r *resourceAllocationScorer) calculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	var podRequest int64
@@ -134,13 +132,4 @@ func (r *resourceAllocationScorer) calculatePodResourceRequest(pod *v1.Pod, reso
 	}
 
 	return podRequest
-}
-
-// resourcesToWeightMap make weightmap from resources spec
-func resourcesToWeightMap(resources []config.ResourceSpec) resourceToWeightMap {
-	resourceToWeightMap := make(resourceToWeightMap)
-	for _, resource := range resources {
-		resourceToWeightMap[v1.ResourceName(resource.Name)] = resource.Weight
-	}
-	return resourceToWeightMap
 }

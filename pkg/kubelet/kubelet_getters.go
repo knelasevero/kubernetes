@@ -77,6 +77,12 @@ func (kl *Kubelet) getPluginDir(pluginName string) string {
 	return filepath.Join(kl.getPluginsDir(), pluginName)
 }
 
+// getCheckpointsDir returns a data directory name for checkpoints.
+// Checkpoints can be stored in this directory for further use.
+func (kl *Kubelet) getCheckpointsDir() string {
+	return filepath.Join(kl.getRootDir(), config.DefaultKubeletCheckpointsDirName)
+}
+
 // getVolumeDevicePluginsDir returns the full path to the directory under which plugin
 // directories are created.  Plugins can use these directories for data that
 // they need to persist.  Plugins should create subdirectories under this named
@@ -185,8 +191,8 @@ func (kl *Kubelet) GetPods() []*v1.Pod {
 // container runtime cache. This function converts kubecontainer.Pod to
 // v1.Pod, so only the fields that exist in both kubecontainer.Pod and
 // v1.Pod are considered meaningful.
-func (kl *Kubelet) GetRunningPods() ([]*v1.Pod, error) {
-	pods, err := kl.runtimeCache.GetPods()
+func (kl *Kubelet) GetRunningPods(ctx context.Context) ([]*v1.Pod, error) {
+	pods, err := kl.runtimeCache.GetPods(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +303,7 @@ func (kl *Kubelet) getPodVolumePathListFromDisk(podUID types.UID) ([]string, err
 	if pathExists, pathErr := mount.PathExists(podVolDir); pathErr != nil {
 		return volumes, fmt.Errorf("error checking if path %q exists: %v", podVolDir, pathErr)
 	} else if !pathExists {
-		klog.InfoS("Path does not exist", "path", podVolDir)
+		klog.V(6).InfoS("Path does not exist", "path", podVolDir)
 		return volumes, nil
 	}
 

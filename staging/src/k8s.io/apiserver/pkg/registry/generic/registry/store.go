@@ -110,6 +110,9 @@ type Store struct {
 	// See qualifiedResourceFromContext for details.
 	DefaultQualifiedResource schema.GroupResource
 
+	// SingularQualifiedResource is the singular name of the resource.
+	SingularQualifiedResource schema.GroupResource
+
 	// KeyRootFunc returns the root etcd key for this resource; should not
 	// include trailing "/".  This is used for operations that work on the
 	// entire collection (listing and watching).
@@ -228,6 +231,8 @@ type Store struct {
 var _ rest.StandardStorage = &Store{}
 var _ rest.TableConvertor = &Store{}
 var _ GenericStore = &Store{}
+
+var _ rest.SingularNameProvider = &Store{}
 
 const (
 	OptimisticLockErrorMsg        = "the object has been modified; please apply your changes to the latest version and try again"
@@ -387,6 +392,9 @@ func (e *Store) Create(ctx context.Context, obj runtime.Object, createValidation
 		return nil, err
 	} else {
 		rest.FillObjectMetaSystemFields(objectMeta)
+		if len(objectMeta.GetGenerateName()) > 0 && len(objectMeta.GetName()) == 0 {
+			objectMeta.SetName(e.CreateStrategy.GenerateName(objectMeta.GetGenerateName()))
+		}
 	}
 
 	if e.BeginCreate != nil {
@@ -924,13 +932,13 @@ func markAsDeleting(obj runtime.Object, now time.Time) (err error) {
 // grace period seconds (graceful deletion) and updating the list of
 // finalizers (finalization); it returns:
 //
-// 1. an error
-// 2. a boolean indicating that the object was not found, but it should be
-//    ignored
-// 3. a boolean indicating that the object's grace period is exhausted and it
-//    should be deleted immediately
-// 4. a new output object with the state that was updated
-// 5. a copy of the last existing state of the object
+//  1. an error
+//  2. a boolean indicating that the object was not found, but it should be
+//     ignored
+//  3. a boolean indicating that the object's grace period is exhausted and it
+//     should be deleted immediately
+//  4. a new output object with the state that was updated
+//  5. a copy of the last existing state of the object
 func (e *Store) updateForGracefulDeletionAndFinalizers(ctx context.Context, name, key string, options *metav1.DeleteOptions, preconditions storage.Preconditions, deleteValidation rest.ValidateObjectFunc, in runtime.Object) (err error, ignoreNotFound, deleteImmediately bool, out, lastExisting runtime.Object) {
 	lastGraceful := int64(0)
 	var pendingFinalizers bool
@@ -1317,6 +1325,12 @@ func (e *Store) CompleteWithOptions(options *generic.StoreOptions) error {
 	if e.DefaultQualifiedResource.Empty() {
 		return fmt.Errorf("store %#v must have a non-empty qualified resource", e)
 	}
+	if e.SingularQualifiedResource.Empty() {
+		return fmt.Errorf("store %#v must have a non-empty singular qualified resource", e)
+	}
+	if e.DefaultQualifiedResource.Group != e.SingularQualifiedResource.Group {
+		return fmt.Errorf("store for %#v, singular and plural qualified resource's group name's must match", e)
+	}
 	if e.NewFunc == nil {
 		return fmt.Errorf("store for %s must have NewFunc set", e.DefaultQualifiedResource.String())
 	}
@@ -1510,6 +1524,10 @@ func (e *Store) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 		return nil
 	}
 	return e.ResetFieldsStrategy.GetResetFields()
+}
+
+func (e *Store) GetSingularName() string {
+	return e.SingularQualifiedResource.Resource
 }
 
 // validateIndexers will check the prefix of indexers.

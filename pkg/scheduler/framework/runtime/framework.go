@@ -75,6 +75,7 @@ type frameworkImpl struct {
 	snapshotSharedLister framework.SharedLister
 	waitingPods          *waitingPodsMap
 	scorePluginWeight    map[string]int
+	preEnqueuePlugins    []framework.PreEnqueuePlugin
 	queueSortPlugins     []framework.QueueSortPlugin
 	preFilterPlugins     []framework.PreFilterPlugin
 	filterPlugins        []framework.FilterPlugin
@@ -91,9 +92,11 @@ type frameworkImpl struct {
 	kubeConfig      *restclient.Config
 	eventRecorder   events.EventRecorder
 	informerFactory informers.SharedInformerFactory
+	logger          klog.Logger
 
-	metricsRecorder *metricsRecorder
-	profileName     string
+	metricsRecorder          *metrics.MetricAsyncRecorder
+	profileName              string
+	percentageOfNodesToScore *int32
 
 	extenders []framework.Extender
 	framework.PodNominator
@@ -124,6 +127,7 @@ func (f *frameworkImpl) getExtensionPoints(plugins *config.Plugins) []extensionP
 		{&plugins.Bind, &f.bindPlugins},
 		{&plugins.PostBind, &f.postBindPlugins},
 		{&plugins.Permit, &f.permitPlugins},
+		{&plugins.PreEnqueue, &f.preEnqueuePlugins},
 		{&plugins.QueueSort, &f.queueSortPlugins},
 	}
 }
@@ -140,12 +144,13 @@ type frameworkOptions struct {
 	eventRecorder          events.EventRecorder
 	informerFactory        informers.SharedInformerFactory
 	snapshotSharedLister   framework.SharedLister
-	metricsRecorder        *metricsRecorder
+	metricsRecorder        *metrics.MetricAsyncRecorder
 	podNominator           framework.PodNominator
 	extenders              []framework.Extender
 	captureProfile         CaptureProfile
 	clusterEventMap        map[framework.ClusterEvent]sets.String
 	parallelizer           parallelize.Parallelizer
+	logger                 *klog.Logger
 }
 
 // Option for the frameworkImpl.
@@ -227,9 +232,16 @@ func WithCaptureProfile(c CaptureProfile) Option {
 	}
 }
 
+// WithLogger overrides the default logger from k8s.io/klog.
+func WithLogger(logger klog.Logger) Option {
+	return func(o *frameworkOptions) {
+		o.logger = &logger
+	}
+}
+
 func defaultFrameworkOptions(stopCh <-chan struct{}) frameworkOptions {
 	return frameworkOptions{
-		metricsRecorder: newMetricsRecorder(1000, time.Second, stopCh),
+		metricsRecorder: metrics.NewMetricsAsyncRecorder(1000, time.Second, stopCh),
 		clusterEventMap: make(map[framework.ClusterEvent]sets.String),
 		parallelizer:    parallelize.NewParallelizer(parallelize.DefaultParallelism),
 	}
@@ -251,6 +263,11 @@ func NewFramework(r Registry, profile *config.KubeSchedulerProfile, stopCh <-cha
 		opt(&options)
 	}
 
+	logger := klog.TODO()
+	if options.logger != nil {
+		logger = *options.logger
+	}
+
 	f := &frameworkImpl{
 		registry:             r,
 		snapshotSharedLister: options.snapshotSharedLister,
@@ -264,6 +281,7 @@ func NewFramework(r Registry, profile *config.KubeSchedulerProfile, stopCh <-cha
 		extenders:            options.extenders,
 		PodNominator:         options.podNominator,
 		parallelizer:         options.parallelizer,
+		logger:               logger,
 	}
 
 	if profile == nil {
@@ -271,6 +289,7 @@ func NewFramework(r Registry, profile *config.KubeSchedulerProfile, stopCh <-cha
 	}
 
 	f.profileName = profile.SchedulerName
+	f.percentageOfNodesToScore = profile.PercentageOfNodesToScore
 	if profile.Plugins == nil {
 		return f, nil
 	}
@@ -287,9 +306,10 @@ func NewFramework(r Registry, profile *config.KubeSchedulerProfile, stopCh <-cha
 		pluginConfig[name] = profile.PluginConfig[i].Args
 	}
 	outputProfile := config.KubeSchedulerProfile{
-		SchedulerName: f.profileName,
-		Plugins:       profile.Plugins,
-		PluginConfig:  make([]config.PluginConfig, 0, len(pg)),
+		SchedulerName:            f.profileName,
+		PercentageOfNodesToScore: f.percentageOfNodesToScore,
+		Plugins:                  profile.Plugins,
+		PluginConfig:             make([]config.PluginConfig, 0, len(pg)),
 	}
 
 	pluginsMap := make(map[string]framework.Plugin)
@@ -313,7 +333,7 @@ func NewFramework(r Registry, profile *config.KubeSchedulerProfile, stopCh <-cha
 		pluginsMap[name] = p
 
 		// Update ClusterEventMap in place.
-		fillEventToPluginMap(p, options.clusterEventMap)
+		fillEventToPluginMap(logger, p, options.clusterEventMap)
 	}
 
 	// initialize plugins per individual extension points
@@ -325,7 +345,7 @@ func NewFramework(r Registry, profile *config.KubeSchedulerProfile, stopCh <-cha
 
 	// initialize multiPoint plugins to their expanded extension points
 	if len(profile.Plugins.MultiPoint.Enabled) > 0 {
-		if err := f.expandMultiPointPlugins(profile, pluginsMap); err != nil {
+		if err := f.expandMultiPointPlugins(logger, profile, pluginsMap); err != nil {
 			return nil, err
 		}
 	}
@@ -427,7 +447,7 @@ func (os *orderedSet) delete(s string) {
 	}
 }
 
-func (f *frameworkImpl) expandMultiPointPlugins(profile *config.KubeSchedulerProfile, pluginsMap map[string]framework.Plugin) error {
+func (f *frameworkImpl) expandMultiPointPlugins(logger klog.Logger, profile *config.KubeSchedulerProfile, pluginsMap map[string]framework.Plugin) error {
 	// initialize MultiPoint plugins
 	for _, e := range f.getExtensionPoints(profile.Plugins) {
 		plugins := reflect.ValueOf(e.slicePtr).Elem()
@@ -444,7 +464,7 @@ func (f *frameworkImpl) expandMultiPointPlugins(profile *config.KubeSchedulerPro
 			disabledSet.Insert(disabledPlugin.Name)
 		}
 		if disabledSet.Has("*") {
-			klog.V(4).InfoS("all plugins disabled for extension point, skipping MultiPoint expansion", "extension", pluginType)
+			logger.V(4).Info("all plugins disabled for extension point, skipping MultiPoint expansion", "extension", pluginType)
 			continue
 		}
 
@@ -465,7 +485,7 @@ func (f *frameworkImpl) expandMultiPointPlugins(profile *config.KubeSchedulerPro
 
 			// a plugin that's enabled via MultiPoint can still be disabled for specific extension points
 			if disabledSet.Has(ep.Name) {
-				klog.V(4).InfoS("plugin disabled for extension point", "plugin", ep.Name, "extension", pluginType)
+				logger.V(4).Info("plugin disabled for extension point", "plugin", ep.Name, "extension", pluginType)
 				continue
 			}
 
@@ -475,7 +495,7 @@ func (f *frameworkImpl) expandMultiPointPlugins(profile *config.KubeSchedulerPro
 			// This maintains expected behavior for overriding default plugins (see https://github.com/kubernetes/kubernetes/pull/99582)
 			if enabledSet.has(ep.Name) {
 				overridePlugins.insert(ep.Name)
-				klog.InfoS("MultiPoint plugin is explicitly re-configured; overriding", "plugin", ep.Name)
+				logger.Info("MultiPoint plugin is explicitly re-configured; overriding", "plugin", ep.Name)
 				continue
 			}
 
@@ -514,7 +534,7 @@ func (f *frameworkImpl) expandMultiPointPlugins(profile *config.KubeSchedulerPro
 	return nil
 }
 
-func fillEventToPluginMap(p framework.Plugin, eventToPlugins map[framework.ClusterEvent]sets.String) {
+func fillEventToPluginMap(logger klog.Logger, p framework.Plugin, eventToPlugins map[framework.ClusterEvent]sets.String) {
 	ext, ok := p.(framework.EnqueueExtensions)
 	if !ok {
 		// If interface EnqueueExtensions is not implemented, register the default events
@@ -528,7 +548,7 @@ func fillEventToPluginMap(p framework.Plugin, eventToPlugins map[framework.Clust
 	// We treat it as: the plugin is not interested in any event, and hence pod failed by that plugin
 	// cannot be moved by any regular cluster event.
 	if len(events) == 0 {
-		klog.InfoS("Plugin's EventsToRegister() returned nil", "plugin", p.Name())
+		logger.Info("Plugin's EventsToRegister() returned nil", "plugin", p.Name())
 		return
 	}
 	// The most common case: a plugin implements EnqueueExtensions and returns non-nil result.
@@ -571,6 +591,11 @@ func updatePluginList(pluginList interface{}, pluginSet config.PluginSet, plugin
 	return nil
 }
 
+// EnqueuePlugins returns the registered enqueue plugins.
+func (f *frameworkImpl) PreEnqueuePlugins() []framework.PreEnqueuePlugin {
+	return f.preEnqueuePlugins
+}
+
 // QueueSortFunc returns the function to sort pods in scheduling queue
 func (f *frameworkImpl) QueueSortFunc() framework.LessFunc {
 	if f == nil {
@@ -589,8 +614,10 @@ func (f *frameworkImpl) QueueSortFunc() framework.LessFunc {
 
 // RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns
 // *Status and its code is set to non-success if any of the plugins returns
-// anything but Success. If a non-success status is returned, then the scheduling
-// cycle is aborted.
+// anything but Success/Skip.
+// When it returns Skip status, returned PreFilterResult and other fields in status are just ignored,
+// and coupled Filter plugin/PreFilterExtensions() will be skipped in this scheduling cycle.
+// If a non-success status is returned, then the scheduling cycle is aborted.
 func (f *frameworkImpl) RunPreFilterPlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (_ *framework.PreFilterResult, status *framework.Status) {
 	startTime := time.Now()
 	defer func() {
@@ -598,14 +625,33 @@ func (f *frameworkImpl) RunPreFilterPlugins(ctx context.Context, state *framewor
 	}()
 	var result *framework.PreFilterResult
 	var pluginsWithNodes []string
+	skipPlugins := sets.New[string]()
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "PreFilter")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	for _, pl := range f.preFilterPlugins {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		r, s := f.runPreFilterPlugin(ctx, pl, state, pod)
+		if s.IsSkip() {
+			skipPlugins.Insert(pl.Name())
+			continue
+		}
 		if !s.IsSuccess() {
 			s.SetFailedPlugin(pl.Name())
 			if s.IsUnschedulable() {
 				return nil, s
 			}
-			return nil, framework.AsStatus(fmt.Errorf("running PreFilter plugin %q: %w", pl.Name(), status.AsError())).WithFailedPlugin(pl.Name())
+			return nil, framework.AsStatus(fmt.Errorf("running PreFilter plugin %q: %w", pl.Name(), s.AsError())).WithFailedPlugin(pl.Name())
 		}
 		if !r.AllNodes() {
 			pluginsWithNodes = append(pluginsWithNodes, pl.Name())
@@ -618,8 +664,8 @@ func (f *frameworkImpl) RunPreFilterPlugins(ctx context.Context, state *framewor
 			}
 			return nil, framework.NewStatus(framework.Unschedulable, msg)
 		}
-
 	}
+	state.SkipFilterPlugins = skipPlugins
 	return result, nil
 }
 
@@ -629,7 +675,7 @@ func (f *frameworkImpl) runPreFilterPlugin(ctx context.Context, pl framework.Pre
 	}
 	startTime := time.Now()
 	result, status := pl.PreFilter(ctx, state, pod)
-	f.metricsRecorder.observePluginDurationAsync(preFilter, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(preFilter, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return result, status
 }
 
@@ -643,14 +689,28 @@ func (f *frameworkImpl) RunPreFilterExtensionAddPod(
 	podInfoToAdd *framework.PodInfo,
 	nodeInfo *framework.NodeInfo,
 ) (status *framework.Status) {
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "AddPod")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter")
 	for _, pl := range f.preFilterPlugins {
-		if pl.PreFilterExtensions() == nil {
+		if pl.PreFilterExtensions() == nil || state.SkipFilterPlugins.Has(pl.Name()) {
 			continue
 		}
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		status = f.runPreFilterExtensionAddPod(ctx, pl, state, podToSchedule, podInfoToAdd, nodeInfo)
 		if !status.IsSuccess() {
 			err := status.AsError()
-			klog.ErrorS(err, "Failed running AddPod on PreFilter plugin", "plugin", pl.Name(), "pod", klog.KObj(podToSchedule))
+			logger.Error(err, "Plugin failed", "pod", klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter", "extension", "AddPod", "plugin", pl.Name())
 			return framework.AsStatus(fmt.Errorf("running AddPod on PreFilter plugin %q: %w", pl.Name(), err))
 		}
 	}
@@ -664,7 +724,7 @@ func (f *frameworkImpl) runPreFilterExtensionAddPod(ctx context.Context, pl fram
 	}
 	startTime := time.Now()
 	status := pl.PreFilterExtensions().AddPod(ctx, state, podToSchedule, podInfoToAdd, nodeInfo)
-	f.metricsRecorder.observePluginDurationAsync(preFilterExtensionAddPod, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(preFilterExtensionAddPod, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
@@ -678,14 +738,28 @@ func (f *frameworkImpl) RunPreFilterExtensionRemovePod(
 	podInfoToRemove *framework.PodInfo,
 	nodeInfo *framework.NodeInfo,
 ) (status *framework.Status) {
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "RemovePod")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, klog.KObj(podToSchedule), "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter")
 	for _, pl := range f.preFilterPlugins {
-		if pl.PreFilterExtensions() == nil {
+		if pl.PreFilterExtensions() == nil || state.SkipFilterPlugins.Has(pl.Name()) {
 			continue
 		}
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		status = f.runPreFilterExtensionRemovePod(ctx, pl, state, podToSchedule, podInfoToRemove, nodeInfo)
 		if !status.IsSuccess() {
 			err := status.AsError()
-			klog.ErrorS(err, "Failed running RemovePod on PreFilter plugin", "plugin", pl.Name(), "pod", klog.KObj(podToSchedule))
+			logger.Error(err, "Plugin failed", "node", klog.KObj(nodeInfo.Node()), "extensibleAPI", "PreFilter", "extension", "RemovePod", "plugin", pl.Name())
 			return framework.AsStatus(fmt.Errorf("running RemovePod on PreFilter plugin %q: %w", pl.Name(), err))
 		}
 	}
@@ -699,7 +773,7 @@ func (f *frameworkImpl) runPreFilterExtensionRemovePod(ctx context.Context, pl f
 	}
 	startTime := time.Now()
 	status := pl.PreFilterExtensions().RemovePod(ctx, state, podToSchedule, podInfoToRemove, nodeInfo)
-	f.metricsRecorder.observePluginDurationAsync(preFilterExtensionRemovePod, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(preFilterExtensionRemovePod, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
@@ -712,23 +786,38 @@ func (f *frameworkImpl) RunFilterPlugins(
 	state *framework.CycleState,
 	pod *v1.Pod,
 	nodeInfo *framework.NodeInfo,
-) framework.PluginToStatus {
-	statuses := make(framework.PluginToStatus)
+) *framework.Status {
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "Filter")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.KObj(nodeInfo.Node()))
+
 	for _, pl := range f.filterPlugins {
-		pluginStatus := f.runFilterPlugin(ctx, pl, state, pod, nodeInfo)
-		if !pluginStatus.IsSuccess() {
-			if !pluginStatus.IsUnschedulable() {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
+		if state.SkipFilterPlugins.Has(pl.Name()) {
+			continue
+		}
+		if status := f.runFilterPlugin(ctx, pl, state, pod, nodeInfo); !status.IsSuccess() {
+			if !status.IsUnschedulable() {
 				// Filter plugins are not supposed to return any status other than
 				// Success or Unschedulable.
-				errStatus := framework.AsStatus(fmt.Errorf("running %q filter plugin: %w", pl.Name(), pluginStatus.AsError())).WithFailedPlugin(pl.Name())
-				return map[string]*framework.Status{pl.Name(): errStatus}
+				status = framework.AsStatus(fmt.Errorf("running %q filter plugin: %w", pl.Name(), status.AsError()))
 			}
-			pluginStatus.SetFailedPlugin(pl.Name())
-			statuses[pl.Name()] = pluginStatus
+			status.SetFailedPlugin(pl.Name())
+			return status
 		}
 	}
 
-	return statuses
+	return nil
 }
 
 func (f *frameworkImpl) runFilterPlugin(ctx context.Context, pl framework.FilterPlugin, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
@@ -737,35 +826,57 @@ func (f *frameworkImpl) runFilterPlugin(ctx context.Context, pl framework.Filter
 	}
 	startTime := time.Now()
 	status := pl.Filter(ctx, state, pod, nodeInfo)
-	f.metricsRecorder.observePluginDurationAsync(Filter, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(Filter, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
 // RunPostFilterPlugins runs the set of configured PostFilter plugins until the first
-// Success or Error is met, otherwise continues to execute all plugins.
+// Success, Error or UnschedulableAndUnresolvable is met; otherwise continues to execute all plugins.
 func (f *frameworkImpl) RunPostFilterPlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, filteredNodeStatusMap framework.NodeToStatusMap) (_ *framework.PostFilterResult, status *framework.Status) {
 	startTime := time.Now()
 	defer func() {
 		metrics.FrameworkExtensionPointDuration.WithLabelValues(postFilter, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
 	}()
-
-	statuses := make(framework.PluginToStatus)
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "PostFilter")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	// `result` records the last meaningful(non-noop) PostFilterResult.
 	var result *framework.PostFilterResult
+	var reasons []string
+	var failedPlugin string
 	for _, pl := range f.postFilterPlugins {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		r, s := f.runPostFilterPlugin(ctx, pl, state, pod, filteredNodeStatusMap)
 		if s.IsSuccess() {
 			return r, s
+		} else if s.Code() == framework.UnschedulableAndUnresolvable {
+			return r, s.WithFailedPlugin(pl.Name())
 		} else if !s.IsUnschedulable() {
-			// Any status other than Success or Unschedulable is Error.
-			return nil, framework.AsStatus(s.AsError())
+			// Any status other than Success, Unschedulable or UnschedulableAndUnresolvable is Error.
+			return nil, framework.AsStatus(s.AsError()).WithFailedPlugin(pl.Name())
 		} else if r != nil && r.Mode() != framework.ModeNoop {
 			result = r
 		}
-		statuses[pl.Name()] = s
+
+		reasons = append(reasons, s.Reasons()...)
+		// Record the first failed plugin unless we proved that
+		// the latter is more relevant.
+		if len(failedPlugin) == 0 {
+			failedPlugin = pl.Name()
+		}
 	}
 
-	return result, statuses.Merge()
+	return result, framework.NewStatus(framework.Unschedulable, reasons...).WithFailedPlugin(failedPlugin)
 }
 
 func (f *frameworkImpl) runPostFilterPlugin(ctx context.Context, pl framework.PostFilterPlugin, state *framework.CycleState, pod *v1.Pod, filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
@@ -774,7 +885,7 @@ func (f *frameworkImpl) runPostFilterPlugin(ctx context.Context, pl framework.Po
 	}
 	startTime := time.Now()
 	r, s := pl.PostFilter(ctx, state, pod, filteredNodeStatusMap)
-	f.metricsRecorder.observePluginDurationAsync(postFilter, pl.Name(), s, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(postFilter, pl.Name(), s.Code().String(), metrics.SinceInSeconds(startTime))
 	return r, s
 }
 
@@ -810,6 +921,9 @@ func (f *frameworkImpl) RunFilterPluginsWithNominatedPods(ctx context.Context, s
 	// the nominated pods are treated as not running. We can't just assume the
 	// nominated pods are running because they are not running right now and in fact,
 	// they may end up getting scheduled to a different node.
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "NominatedPods")
+	ctx = klog.NewContext(ctx, logger)
 	for i := 0; i < 2; i++ {
 		stateToUse := state
 		nodeInfoToUse := info
@@ -823,8 +937,7 @@ func (f *frameworkImpl) RunFilterPluginsWithNominatedPods(ctx context.Context, s
 			break
 		}
 
-		statusMap := f.RunFilterPlugins(ctx, stateToUse, pod, nodeInfoToUse)
-		status = statusMap.Merge()
+		status = f.RunFilterPlugins(ctx, stateToUse, pod, nodeInfoToUse)
 		if !status.IsSuccess() && !status.IsUnschedulable() {
 			return status
 		}
@@ -841,7 +954,8 @@ func addNominatedPods(ctx context.Context, fh framework.Handle, pod *v1.Pod, sta
 		// This may happen only in tests.
 		return false, state, nodeInfo, nil
 	}
-	nominatedPodInfos := fh.NominatedPodsForNode(nodeInfo.Node().Name)
+	logger := klog.FromContext(ctx)
+	nominatedPodInfos := fh.NominatedPodsForNode(logger, nodeInfo.Node().Name)
 	if len(nominatedPodInfos) == 0 {
 		return false, state, nodeInfo, nil
 	}
@@ -862,7 +976,9 @@ func addNominatedPods(ctx context.Context, fh framework.Handle, pod *v1.Pod, sta
 }
 
 // RunPreScorePlugins runs the set of configured pre-score plugins. If any
-// of these plugins returns any status other than "Success", the given pod is rejected.
+// of these plugins returns any status other than Success/Skip, the given pod is rejected.
+// When it returns Skip status, other fields in status are just ignored,
+// and coupled Score plugin will be skipped in this scheduling cycle.
 func (f *frameworkImpl) RunPreScorePlugins(
 	ctx context.Context,
 	state *framework.CycleState,
@@ -873,13 +989,32 @@ func (f *frameworkImpl) RunPreScorePlugins(
 	defer func() {
 		metrics.FrameworkExtensionPointDuration.WithLabelValues(preScore, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
 	}()
+	skipPlugins := sets.New[string]()
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "PreScore")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	for _, pl := range f.preScorePlugins {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		status = f.runPreScorePlugin(ctx, pl, state, pod, nodes)
+		if status.IsSkip() {
+			skipPlugins.Insert(pl.Name())
+			continue
+		}
 		if !status.IsSuccess() {
 			return framework.AsStatus(fmt.Errorf("running PreScore plugin %q: %w", pl.Name(), status.AsError()))
 		}
 	}
-
+	state.SkipScorePlugins = skipPlugins
 	return nil
 }
 
@@ -889,86 +1024,122 @@ func (f *frameworkImpl) runPreScorePlugin(ctx context.Context, pl framework.PreS
 	}
 	startTime := time.Now()
 	status := pl.PreScore(ctx, state, pod, nodes)
-	f.metricsRecorder.observePluginDurationAsync(preScore, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(preScore, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
-// RunScorePlugins runs the set of configured scoring plugins. It returns a list that
-// stores for each scoring plugin name the corresponding NodeScoreList(s).
+// RunScorePlugins runs the set of configured scoring plugins.
+// It returns a list that stores scores from each plugin and total score for each Node.
 // It also returns *Status, which is set to non-success if any of the plugins returns
 // a non-success status.
-func (f *frameworkImpl) RunScorePlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) (ps framework.PluginToNodeScores, status *framework.Status) {
+func (f *frameworkImpl) RunScorePlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) (ns []framework.NodePluginScores, status *framework.Status) {
 	startTime := time.Now()
 	defer func() {
 		metrics.FrameworkExtensionPointDuration.WithLabelValues(score, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
 	}()
-	pluginToNodeScores := make(framework.PluginToNodeScores, len(f.scorePlugins))
+	allNodePluginScores := make([]framework.NodePluginScores, len(nodes))
+	numPlugins := len(f.scorePlugins) - state.SkipScorePlugins.Len()
+	plugins := make([]framework.ScorePlugin, 0, numPlugins)
+	pluginToNodeScores := make(map[string]framework.NodeScoreList, numPlugins)
 	for _, pl := range f.scorePlugins {
+		if state.SkipScorePlugins.Has(pl.Name()) {
+			continue
+		}
+		plugins = append(plugins, pl)
 		pluginToNodeScores[pl.Name()] = make(framework.NodeScoreList, len(nodes))
 	}
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errCh := parallelize.NewErrorChannel()
 
-	// Run Score method for each node in parallel.
-	f.Parallelizer().Until(ctx, len(nodes), func(index int) {
-		for _, pl := range f.scorePlugins {
+	if len(plugins) > 0 {
+		logger := klog.FromContext(ctx)
+		logger = klog.LoggerWithName(logger, "Score")
+		// We are adding LoggerWithValues for contextualized logging here
+		// but contextualized logging is feature gated and optional until
+		// it hits GA when it will be defaulted. For that reason
+		// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+		// WithValues Key/Values while contextualized logging does not hit GA
+		// (duplicates get filtered out if contextualized logging is enabled)
+		// TODO(knelasevero): Remove duplicated keys from log entry calls
+		// When contextualized logging hits GA
+		// https://github.com/kubernetes/kubernetes/issues/111672
+		logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
+		// Run Score method for each node in parallel.
+		f.Parallelizer().Until(ctx, len(nodes), func(index int) {
 			nodeName := nodes[index].Name
-			s, status := f.runScorePlugin(ctx, pl, state, pod, nodeName)
-			if !status.IsSuccess() {
-				err := fmt.Errorf("plugin %q failed with: %w", pl.Name(), status.AsError())
-				errCh.SendErrorWithCancel(err, cancel)
-				return
+			logger := klog.LoggerWithValues(logger, "node", klog.ObjectRef{Name: nodeName})
+			for _, pl := range plugins {
+				logger := klog.LoggerWithName(logger, pl.Name())
+				ctx := klog.NewContext(ctx, logger)
+				nodeName := nodes[index].Name
+				s, status := f.runScorePlugin(ctx, pl, state, pod, nodeName)
+				if !status.IsSuccess() {
+					err := fmt.Errorf("plugin %q failed with: %w", pl.Name(), status.AsError())
+					errCh.SendErrorWithCancel(err, cancel)
+					return
+				}
+				pluginToNodeScores[pl.Name()][index] = framework.NodeScore{
+					Name:  nodeName,
+					Score: s,
+				}
 			}
-			pluginToNodeScores[pl.Name()][index] = framework.NodeScore{
-				Name:  nodeName,
-				Score: s,
-			}
+		}, score)
+		if err := errCh.ReceiveError(); err != nil {
+			return nil, framework.AsStatus(fmt.Errorf("running Score plugins: %w", err))
 		}
-	})
-	if err := errCh.ReceiveError(); err != nil {
-		return nil, framework.AsStatus(fmt.Errorf("running Score plugins: %w", err))
 	}
 
 	// Run NormalizeScore method for each ScorePlugin in parallel.
-	f.Parallelizer().Until(ctx, len(f.scorePlugins), func(index int) {
-		pl := f.scorePlugins[index]
-		nodeScoreList := pluginToNodeScores[pl.Name()]
+	f.Parallelizer().Until(ctx, len(plugins), func(index int) {
+		pl := plugins[index]
 		if pl.ScoreExtensions() == nil {
 			return
 		}
+		nodeScoreList := pluginToNodeScores[pl.Name()]
 		status := f.runScoreExtension(ctx, pl, state, pod, nodeScoreList)
 		if !status.IsSuccess() {
 			err := fmt.Errorf("plugin %q failed with: %w", pl.Name(), status.AsError())
 			errCh.SendErrorWithCancel(err, cancel)
 			return
 		}
-	})
+	}, score)
 	if err := errCh.ReceiveError(); err != nil {
 		return nil, framework.AsStatus(fmt.Errorf("running Normalize on Score plugins: %w", err))
 	}
 
-	// Apply score defaultWeights for each ScorePlugin in parallel.
-	f.Parallelizer().Until(ctx, len(f.scorePlugins), func(index int) {
-		pl := f.scorePlugins[index]
-		// Score plugins' weight has been checked when they are initialized.
-		weight := f.scorePluginWeight[pl.Name()]
-		nodeScoreList := pluginToNodeScores[pl.Name()]
+	// Apply score weight for each ScorePlugin in parallel,
+	// and then, build allNodePluginScores.
+	f.Parallelizer().Until(ctx, len(nodes), func(index int) {
+		nodePluginScores := framework.NodePluginScores{
+			Name:   nodes[index].Name,
+			Scores: make([]framework.PluginScore, len(plugins)),
+		}
 
-		for i, nodeScore := range nodeScoreList {
-			// return error if score plugin returns invalid score.
-			if nodeScore.Score > framework.MaxNodeScore || nodeScore.Score < framework.MinNodeScore {
-				err := fmt.Errorf("plugin %q returns an invalid score %v, it should in the range of [%v, %v] after normalizing", pl.Name(), nodeScore.Score, framework.MinNodeScore, framework.MaxNodeScore)
+		for i, pl := range plugins {
+			weight := f.scorePluginWeight[pl.Name()]
+			nodeScoreList := pluginToNodeScores[pl.Name()]
+			score := nodeScoreList[index].Score
+
+			if score > framework.MaxNodeScore || score < framework.MinNodeScore {
+				err := fmt.Errorf("plugin %q returns an invalid score %v, it should in the range of [%v, %v] after normalizing", pl.Name(), score, framework.MinNodeScore, framework.MaxNodeScore)
 				errCh.SendErrorWithCancel(err, cancel)
 				return
 			}
-			nodeScoreList[i].Score = nodeScore.Score * int64(weight)
+			weightedScore := score * int64(weight)
+			nodePluginScores.Scores[i] = framework.PluginScore{
+				Name:  pl.Name(),
+				Score: weightedScore,
+			}
+			nodePluginScores.TotalScore += weightedScore
 		}
-	})
+		allNodePluginScores[index] = nodePluginScores
+	}, score)
 	if err := errCh.ReceiveError(); err != nil {
 		return nil, framework.AsStatus(fmt.Errorf("applying score defaultWeights on Score plugins: %w", err))
 	}
 
-	return pluginToNodeScores, nil
+	return allNodePluginScores, nil
 }
 
 func (f *frameworkImpl) runScorePlugin(ctx context.Context, pl framework.ScorePlugin, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
@@ -977,7 +1148,7 @@ func (f *frameworkImpl) runScorePlugin(ctx context.Context, pl framework.ScorePl
 	}
 	startTime := time.Now()
 	s, status := pl.Score(ctx, state, pod, nodeName)
-	f.metricsRecorder.observePluginDurationAsync(score, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(score, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return s, status
 }
 
@@ -987,7 +1158,7 @@ func (f *frameworkImpl) runScoreExtension(ctx context.Context, pl framework.Scor
 	}
 	startTime := time.Now()
 	status := pl.ScoreExtensions().NormalizeScore(ctx, state, pod, nodeScoreList)
-	f.metricsRecorder.observePluginDurationAsync(scoreExtensionNormalize, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(scoreExtensionNormalize, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
@@ -999,11 +1170,31 @@ func (f *frameworkImpl) RunPreBindPlugins(ctx context.Context, state *framework.
 	defer func() {
 		metrics.FrameworkExtensionPointDuration.WithLabelValues(preBind, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
 	}()
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "PreBind")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
+	logger = klog.LoggerWithValues(logger, "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.preBindPlugins {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		status = f.runPreBindPlugin(ctx, pl, state, pod, nodeName)
 		if !status.IsSuccess() {
+			if status.IsUnschedulable() {
+				logger.V(4).Info("Pod rejected by PreBind plugin", "pod", klog.KObj(pod), "node", nodeName, "plugin", pl.Name(), "status", status.Message())
+				status.SetFailedPlugin(pl.Name())
+				return status
+			}
 			err := status.AsError()
-			klog.ErrorS(err, "Failed running PreBind plugin", "plugin", pl.Name(), "pod", klog.KObj(pod))
+			logger.Error(err, "Failed running PreBind plugin", "plugin", pl.Name(), "pod", klog.KObj(pod), "node", nodeName, "extensibleAPI", "PreBind")
 			return framework.AsStatus(fmt.Errorf("running PreBind plugin %q: %w", pl.Name(), err))
 		}
 	}
@@ -1016,7 +1207,7 @@ func (f *frameworkImpl) runPreBindPlugin(ctx context.Context, pl framework.PreBi
 	}
 	startTime := time.Now()
 	status := pl.PreBind(ctx, state, pod, nodeName)
-	f.metricsRecorder.observePluginDurationAsync(preBind, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(preBind, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
@@ -1029,14 +1220,33 @@ func (f *frameworkImpl) RunBindPlugins(ctx context.Context, state *framework.Cyc
 	if len(f.bindPlugins) == 0 {
 		return framework.NewStatus(framework.Skip, "")
 	}
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "Bind")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, bp := range f.bindPlugins {
+		logger := klog.LoggerWithName(logger, bp.Name())
+		ctx := klog.NewContext(ctx, logger)
 		status = f.runBindPlugin(ctx, bp, state, pod, nodeName)
 		if status.IsSkip() {
 			continue
 		}
 		if !status.IsSuccess() {
+			if status.IsUnschedulable() {
+				logger.V(4).Info("Pod rejected by Bind plugin", "pod", klog.KObj(pod), "node", nodeName, "plugin", bp.Name(), "status", status.Message())
+				status.SetFailedPlugin(bp.Name())
+				return status
+			}
 			err := status.AsError()
-			klog.ErrorS(err, "Failed running Bind plugin", "plugin", bp.Name(), "pod", klog.KObj(pod))
+			logger.Error(err, "Failed running Bind plugin", "plugin", bp.Name(), "pod", klog.KObj(pod), "node", nodeName)
 			return framework.AsStatus(fmt.Errorf("running Bind plugin %q: %w", bp.Name(), err))
 		}
 		return status
@@ -1050,7 +1260,7 @@ func (f *frameworkImpl) runBindPlugin(ctx context.Context, bp framework.BindPlug
 	}
 	startTime := time.Now()
 	status := bp.Bind(ctx, state, pod, nodeName)
-	f.metricsRecorder.observePluginDurationAsync(bind, bp.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(bind, bp.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
@@ -1060,7 +1270,21 @@ func (f *frameworkImpl) RunPostBindPlugins(ctx context.Context, state *framework
 	defer func() {
 		metrics.FrameworkExtensionPointDuration.WithLabelValues(postBind, framework.Success.String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
 	}()
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "PostBind")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.postBindPlugins {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		f.runPostBindPlugin(ctx, pl, state, pod, nodeName)
 	}
 }
@@ -1072,7 +1296,7 @@ func (f *frameworkImpl) runPostBindPlugin(ctx context.Context, pl framework.Post
 	}
 	startTime := time.Now()
 	pl.PostBind(ctx, state, pod, nodeName)
-	f.metricsRecorder.observePluginDurationAsync(postBind, pl.Name(), nil, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(postBind, pl.Name(), framework.Success.String(), metrics.SinceInSeconds(startTime))
 }
 
 // RunReservePluginsReserve runs the Reserve method in the set of configured
@@ -1085,11 +1309,25 @@ func (f *frameworkImpl) RunReservePluginsReserve(ctx context.Context, state *fra
 	defer func() {
 		metrics.FrameworkExtensionPointDuration.WithLabelValues(reserve, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
 	}()
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "Reserve")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.reservePlugins {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		status = f.runReservePluginReserve(ctx, pl, state, pod, nodeName)
 		if !status.IsSuccess() {
 			err := status.AsError()
-			klog.ErrorS(err, "Failed running Reserve plugin", "plugin", pl.Name(), "pod", klog.KObj(pod))
+			logger.Error(err, "Plugin failed")
 			return framework.AsStatus(fmt.Errorf("running Reserve plugin %q: %w", pl.Name(), err))
 		}
 	}
@@ -1102,7 +1340,7 @@ func (f *frameworkImpl) runReservePluginReserve(ctx context.Context, pl framewor
 	}
 	startTime := time.Now()
 	status := pl.Reserve(ctx, state, pod, nodeName)
-	f.metricsRecorder.observePluginDurationAsync(reserve, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(reserve, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status
 }
 
@@ -1115,7 +1353,21 @@ func (f *frameworkImpl) RunReservePluginsUnreserve(ctx context.Context, state *f
 	}()
 	// Execute the Unreserve operation of each reserve plugin in the
 	// *reverse* order in which the Reserve operation was executed.
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "Unreserve")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for i := len(f.reservePlugins) - 1; i >= 0; i-- {
+		logger := klog.LoggerWithName(logger, f.reservePlugins[i].Name())
+		ctx := klog.NewContext(ctx, logger)
 		f.runReservePluginUnreserve(ctx, f.reservePlugins[i], state, pod, nodeName)
 	}
 }
@@ -1127,7 +1379,7 @@ func (f *frameworkImpl) runReservePluginUnreserve(ctx context.Context, pl framew
 	}
 	startTime := time.Now()
 	pl.Unreserve(ctx, state, pod, nodeName)
-	f.metricsRecorder.observePluginDurationAsync(unreserve, pl.Name(), nil, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(unreserve, pl.Name(), framework.Success.String(), metrics.SinceInSeconds(startTime))
 }
 
 // RunPermitPlugins runs the set of configured permit plugins. If any of these
@@ -1143,11 +1395,25 @@ func (f *frameworkImpl) RunPermitPlugins(ctx context.Context, state *framework.C
 	}()
 	pluginsWaitTime := make(map[string]time.Duration)
 	statusCode := framework.Success
+	logger := klog.FromContext(ctx)
+	logger = klog.LoggerWithName(logger, "Permit")
+	// We are adding LoggerWithValues for contextualized logging here
+	// but contextualized logging is feature gated and optional until
+	// it hits GA when it will be defaulted. For that reason
+	// logger.V(<LOGLEVEL>).Info or Error calls still need to include
+	// WithValues Key/Values while contextualized logging does not hit GA
+	// (duplicates get filtered out if contextualized logging is enabled)
+	// TODO(knelasevero): Remove duplicated keys from log entry calls
+	// When contextualized logging hits GA
+	// https://github.com/kubernetes/kubernetes/issues/111672
+	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod), "node", klog.ObjectRef{Name: nodeName})
 	for _, pl := range f.permitPlugins {
+		logger := klog.LoggerWithName(logger, pl.Name())
+		ctx := klog.NewContext(ctx, logger)
 		status, timeout := f.runPermitPlugin(ctx, pl, state, pod, nodeName)
 		if !status.IsSuccess() {
 			if status.IsUnschedulable() {
-				klog.V(4).InfoS("Pod rejected by permit plugin", "pod", klog.KObj(pod), "plugin", pl.Name(), "status", status.Message())
+				logger.V(4).Info("Pod rejected by plugin", "status", status.Message())
 				status.SetFailedPlugin(pl.Name())
 				return status
 			}
@@ -1160,7 +1426,7 @@ func (f *frameworkImpl) RunPermitPlugins(ctx context.Context, state *framework.C
 				statusCode = framework.Wait
 			} else {
 				err := status.AsError()
-				klog.ErrorS(err, "Failed running Permit plugin", "plugin", pl.Name(), "pod", klog.KObj(pod))
+				logger.Error(err, "Plugin failed")
 				return framework.AsStatus(fmt.Errorf("running Permit plugin %q: %w", pl.Name(), err)).WithFailedPlugin(pl.Name())
 			}
 		}
@@ -1169,7 +1435,7 @@ func (f *frameworkImpl) RunPermitPlugins(ctx context.Context, state *framework.C
 		waitingPod := newWaitingPod(pod, pluginsWaitTime)
 		f.waitingPods.add(waitingPod)
 		msg := fmt.Sprintf("one or more plugins asked to wait and no plugin rejected pod %q", pod.Name)
-		klog.V(4).InfoS("One or more plugins asked to wait and no plugin rejected pod", "pod", klog.KObj(pod))
+		logger.V(4).Info("One or more plugins asked to wait and no plugin rejected pod")
 		return framework.NewStatus(framework.Wait, msg)
 	}
 	return nil
@@ -1181,7 +1447,7 @@ func (f *frameworkImpl) runPermitPlugin(ctx context.Context, pl framework.Permit
 	}
 	startTime := time.Now()
 	status, timeout := pl.Permit(ctx, state, pod, nodeName)
-	f.metricsRecorder.observePluginDurationAsync(permit, pl.Name(), status, metrics.SinceInSeconds(startTime))
+	f.metricsRecorder.ObservePluginDurationAsync(permit, pl.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	return status, timeout
 }
 
@@ -1192,7 +1458,9 @@ func (f *frameworkImpl) WaitOnPermit(ctx context.Context, pod *v1.Pod) *framewor
 		return nil
 	}
 	defer f.waitingPods.remove(pod.UID)
-	klog.V(4).InfoS("Pod waiting on permit", "pod", klog.KObj(pod))
+
+	logger := klog.FromContext(ctx)
+	logger.V(4).Info("Pod waiting on permit", "pod", klog.KObj(pod))
 
 	startTime := time.Now()
 	s := <-waitingPod.s
@@ -1200,12 +1468,11 @@ func (f *frameworkImpl) WaitOnPermit(ctx context.Context, pod *v1.Pod) *framewor
 
 	if !s.IsSuccess() {
 		if s.IsUnschedulable() {
-			klog.V(4).InfoS("Pod rejected while waiting on permit", "pod", klog.KObj(pod), "status", s.Message())
-			s.SetFailedPlugin(s.FailedPlugin())
+			logger.V(4).Info("Pod rejected while waiting on permit", "pod", klog.KObj(pod), "status", s.Message())
 			return s
 		}
 		err := s.AsError()
-		klog.ErrorS(err, "Failed waiting on permit for pod", "pod", klog.KObj(pod))
+		logger.Error(err, "Failed waiting on permit for pod", "pod", klog.KObj(pod))
 		return framework.AsStatus(fmt.Errorf("waiting on permit for pod: %w", err)).WithFailedPlugin(s.FailedPlugin())
 	}
 	return nil
@@ -1329,7 +1596,17 @@ func (f *frameworkImpl) ProfileName() string {
 	return f.profileName
 }
 
+// PercentageOfNodesToScore returns percentageOfNodesToScore associated to a profile.
+func (f *frameworkImpl) PercentageOfNodesToScore() *int32 {
+	return f.percentageOfNodesToScore
+}
+
 // Parallelizer returns a parallelizer holding parallelism for scheduler.
 func (f *frameworkImpl) Parallelizer() parallelize.Parallelizer {
 	return f.parallelizer
+}
+
+// Logger returns a logger for background activities.
+func (f *frameworkImpl) Logger() klog.Logger {
+	return f.logger
 }

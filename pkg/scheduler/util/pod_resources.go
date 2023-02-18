@@ -18,11 +18,9 @@ package util
 
 import (
 	v1 "k8s.io/api/core/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/kubernetes/pkg/features"
 )
 
-// For each of these resources, a pod that doesn't request the resource explicitly
+// For each of these resources, a container that doesn't request the resource explicitly
 // will be treated as having requested the amount indicated below, for the purpose
 // of computing priority only. This ensures that when scheduling zero-request pods, such
 // pods will not all be scheduled to the node with the smallest in-use request,
@@ -65,11 +63,6 @@ func GetRequestForResource(resource v1.ResourceName, requests *v1.ResourceList, 
 		}
 		return requests.Memory().Value()
 	case v1.ResourceEphemeralStorage:
-		// if the local storage capacity isolation feature gate is disabled, pods request 0 disk.
-		if !utilfeature.DefaultFeatureGate.Enabled(features.LocalStorageCapacityIsolation) {
-			return 0
-		}
-
 		quantity, found := (*requests)[v1.ResourceEphemeralStorage]
 		if !found {
 			return 0

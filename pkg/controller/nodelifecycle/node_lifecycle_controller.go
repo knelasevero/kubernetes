@@ -50,7 +50,6 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/component-base/metrics/prometheus/ratelimiter"
 	nodetopology "k8s.io/component-helpers/node/topology"
 	kubeletapis "k8s.io/kubelet/pkg/apis"
 	"k8s.io/kubernetes/pkg/controller"
@@ -133,9 +132,9 @@ const (
 // labelReconcileInfo lists Node labels to reconcile, and how to reconcile them.
 // primaryKey and secondaryKey are keys of labels to reconcile.
 //   - If both keys exist, but their values don't match. Use the value from the
-//   primaryKey as the source of truth to reconcile.
+//     primaryKey as the source of truth to reconcile.
 //   - If ensureSecondaryExists is true, and the secondaryKey does not
-//   exist, secondaryKey will be added with the value of the primaryKey.
+//     exist, secondaryKey will be added with the value of the primaryKey.
 var labelReconcileInfo = []struct {
 	primaryKey            string
 	secondaryKey          string
@@ -278,7 +277,6 @@ type Controller struct {
 	nodeHealthMap *nodeHealthMap
 
 	// evictorLock protects zonePodEvictor and zoneNoExecuteTainter.
-	// TODO(#83954): API calls shouldn't be executed under the lock.
 	evictorLock     sync.Mutex
 	nodeEvictionMap *nodeEvictionMap
 	// workers that evicts pods from unresponsive nodes.
@@ -334,6 +332,10 @@ type Controller struct {
 	//    value takes longer for user to see up-to-date node health.
 	nodeMonitorGracePeriod time.Duration
 
+	// Number of workers Controller uses to process node monitor health updates.
+	// Defaults to scheduler.UpdateWorkerSize.
+	nodeUpdateWorkerSize int
+
 	podEvictionTimeout          time.Duration
 	evictionLimiterQPS          float32
 	secondaryEvictionLimiterQPS float32
@@ -374,10 +376,6 @@ func NewNodeLifecycleController(
 	eventBroadcaster := record.NewBroadcaster()
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "node-controller"})
 
-	if kubeClient.CoreV1().RESTClient().GetRateLimiter() != nil {
-		ratelimiter.RegisterMetricAndTrackRateLimiterUsage("node_lifecycle_controller", kubeClient.CoreV1().RESTClient().GetRateLimiter())
-	}
-
 	nc := &Controller{
 		kubeClient:                  kubeClient,
 		now:                         metav1.Now,
@@ -389,6 +387,7 @@ func NewNodeLifecycleController(
 		nodeMonitorPeriod:           nodeMonitorPeriod,
 		nodeStartupGracePeriod:      nodeStartupGracePeriod,
 		nodeMonitorGracePeriod:      nodeMonitorGracePeriod,
+		nodeUpdateWorkerSize:        scheduler.UpdateWorkerSize,
 		zonePodEvictor:              make(map[string]*scheduler.RateLimitedTimedQueue),
 		zoneNoExecuteTainter:        make(map[string]*scheduler.RateLimitedTimedQueue),
 		nodesToRetry:                sync.Map{},
@@ -475,12 +474,10 @@ func NewNodeLifecycleController(
 		return pods, nil
 	}
 	nc.podLister = podInformer.Lister()
+	nc.nodeLister = nodeInformer.Lister()
 
 	if nc.runTaintManager {
-		podGetter := func(name, namespace string) (*v1.Pod, error) { return nc.podLister.Pods(namespace).Get(name) }
-		nodeLister := nodeInformer.Lister()
-		nodeGetter := func(name string) (*v1.Node, error) { return nodeLister.Get(name) }
-		nc.taintManager = scheduler.NewNoExecuteTaintManager(ctx, kubeClient, podGetter, nodeGetter, nc.getPodsAssignedToNode)
+		nc.taintManager = scheduler.NewNoExecuteTaintManager(ctx, kubeClient, nc.podLister, nc.nodeLister, nc.getPodsAssignedToNode)
 		nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc: controllerutil.CreateAddNodeHandler(func(node *v1.Node) error {
 				nc.taintManager.NodeUpdated(nil, node)
@@ -518,7 +515,6 @@ func NewNodeLifecycleController(
 	nc.leaseLister = leaseInformer.Lister()
 	nc.leaseInformerSynced = leaseInformer.Informer().HasSynced
 
-	nc.nodeLister = nodeInformer.Lister()
 	nc.nodeInformerSynced = nodeInformer.Informer().HasSynced
 
 	nc.daemonSetStore = daemonSetInformer.Lister()
@@ -668,11 +664,32 @@ func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, nodeName str
 }
 
 func (nc *Controller) doNoExecuteTaintingPass(ctx context.Context) {
-	nc.evictorLock.Lock()
-	defer nc.evictorLock.Unlock()
-	for k := range nc.zoneNoExecuteTainter {
+	// Extract out the keys of the map in order to not hold
+	// the evictorLock for the entire function and hold it
+	// only when nescessary.
+	var zoneNoExecuteTainterKeys []string
+	func() {
+		nc.evictorLock.Lock()
+		defer nc.evictorLock.Unlock()
+
+		zoneNoExecuteTainterKeys = make([]string, 0, len(nc.zoneNoExecuteTainter))
+		for k := range nc.zoneNoExecuteTainter {
+			zoneNoExecuteTainterKeys = append(zoneNoExecuteTainterKeys, k)
+		}
+	}()
+	for _, k := range zoneNoExecuteTainterKeys {
+		var zoneNoExecuteTainterWorker *scheduler.RateLimitedTimedQueue
+		func() {
+			nc.evictorLock.Lock()
+			defer nc.evictorLock.Unlock()
+			// Extracting the value without checking if the key
+			// exists or not is safe to do here since zones do
+			// not get removed, and consequently pod evictors for
+			// these zones also do not get removed, only added.
+			zoneNoExecuteTainterWorker = nc.zoneNoExecuteTainter[k]
+		}()
 		// Function should return 'false' and a time after which it should be retried, or 'true' if it shouldn't (it succeeded).
-		nc.zoneNoExecuteTainter[k].Try(func(value scheduler.TimedValue) (bool, time.Duration) {
+		zoneNoExecuteTainterWorker.Try(func(value scheduler.TimedValue) (bool, time.Duration) {
 			node, err := nc.nodeLister.Get(value.Value)
 			if apierrors.IsNotFound(err) {
 				klog.Warningf("Node %v no longer present in nodeLister!", value.Value)
@@ -712,11 +729,34 @@ func (nc *Controller) doNoExecuteTaintingPass(ctx context.Context) {
 }
 
 func (nc *Controller) doEvictionPass(ctx context.Context) {
-	nc.evictorLock.Lock()
-	defer nc.evictorLock.Unlock()
-	for k := range nc.zonePodEvictor {
+	// Extract out the keys of the map in order to not hold
+	// the evictorLock for the entire function and hold it
+	// only when nescessary.
+	var zonePodEvictorKeys []string
+	func() {
+		nc.evictorLock.Lock()
+		defer nc.evictorLock.Unlock()
+
+		zonePodEvictorKeys = make([]string, 0, len(nc.zonePodEvictor))
+		for k := range nc.zonePodEvictor {
+			zonePodEvictorKeys = append(zonePodEvictorKeys, k)
+		}
+	}()
+
+	for _, k := range zonePodEvictorKeys {
+		var zonePodEvictionWorker *scheduler.RateLimitedTimedQueue
+		func() {
+			nc.evictorLock.Lock()
+			defer nc.evictorLock.Unlock()
+			// Extracting the value without checking if the key
+			// exists or not is safe to do here since zones do
+			// not get removed, and consequently pod evictors for
+			// these zones also do not get removed, only added.
+			zonePodEvictionWorker = nc.zonePodEvictor[k]
+		}()
+
 		// Function should return 'false' and a time after which it should be retried, or 'true' if it shouldn't (it succeeded).
-		nc.zonePodEvictor[k].Try(func(value scheduler.TimedValue) (bool, time.Duration) {
+		zonePodEvictionWorker.Try(func(value scheduler.TimedValue) (bool, time.Duration) {
 			node, err := nc.nodeLister.Get(value.Value)
 			if apierrors.IsNotFound(err) {
 				klog.Warningf("Node %v no longer present in nodeLister!", value.Value)
@@ -759,6 +799,11 @@ func (nc *Controller) doEvictionPass(ctx context.Context) {
 // if not, post "NodeReady==ConditionUnknown".
 // This function will taint nodes who are not ready or not reachable for a long period of time.
 func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
+	start := nc.now()
+	defer func() {
+		updateAllNodesHealthDuration.Observe(time.Since(start.Time).Seconds())
+	}()
+
 	// We are listing nodes from local cache as we can tolerate some small delays
 	// comparing to state from etcd and there is eventual consistency anyway.
 	nodes, err := nc.nodeLister.List(labels.Everything())
@@ -789,13 +834,21 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 		delete(nc.knownNodeSet, deleted[i].Name)
 	}
 
+	var zoneToNodeConditionsLock sync.Mutex
 	zoneToNodeConditions := map[string][]*v1.NodeCondition{}
-	for i := range nodes {
+	updateNodeFunc := func(piece int) {
+		start := nc.now()
+		defer func() {
+			updateNodeHealthDuration.Observe(time.Since(start.Time).Seconds())
+		}()
+
 		var gracePeriod time.Duration
 		var observedReadyCondition v1.NodeCondition
 		var currentReadyCondition *v1.NodeCondition
-		node := nodes[i].DeepCopy()
+		node := nodes[piece].DeepCopy()
+
 		if err := wait.PollImmediate(retrySleepTime, retrySleepTime*scheduler.NodeHealthUpdateRetry, func() (bool, error) {
+			var err error
 			gracePeriod, observedReadyCondition, currentReadyCondition, err = nc.tryUpdateNodeHealth(ctx, node)
 			if err == nil {
 				return true, nil
@@ -810,12 +863,14 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 		}); err != nil {
 			klog.Errorf("Update health of Node '%v' from Controller error: %v. "+
 				"Skipping - no pods will be evicted.", node.Name, err)
-			continue
+			return
 		}
 
 		// Some nodes may be excluded from disruption checking
 		if !isNodeExcludedFromDisruptionChecks(node) {
+			zoneToNodeConditionsLock.Lock()
 			zoneToNodeConditions[nodetopology.GetZoneKey(node)] = append(zoneToNodeConditions[nodetopology.GetZoneKey(node)], currentReadyCondition)
+			zoneToNodeConditionsLock.Unlock()
 		}
 
 		if currentReadyCondition != nil {
@@ -828,7 +883,7 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 					// in the next iteration.
 					nc.nodesToRetry.Store(node.Name, struct{}{})
 				}
-				continue
+				return
 			}
 			if nc.runTaintManager {
 				nc.processTaintBaseEviction(ctx, node, &observedReadyCondition)
@@ -848,12 +903,20 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 				if err = controllerutil.MarkPodsNotReady(ctx, nc.kubeClient, nc.recorder, pods, node.Name); err != nil {
 					utilruntime.HandleError(fmt.Errorf("unable to mark all pods NotReady on node %v: %v; queuing for retry", node.Name, err))
 					nc.nodesToRetry.Store(node.Name, struct{}{})
-					continue
+					return
 				}
 			}
 		}
 		nc.nodesToRetry.Delete(node.Name)
 	}
+
+	// Marking the pods not ready on a node requires looping over them and
+	// updating each pod's status one at a time. This is performed serially, and
+	// can take a while if we're processing each node serially as well. So we
+	// process them with bounded concurrency instead, since most of the time is
+	// spent waiting on io.
+	workqueue.ParallelizeUntil(ctx, nc.nodeUpdateWorkerSize, len(nodes), updateNodeFunc)
+
 	nc.handleDisruption(ctx, zoneToNodeConditions, nodes)
 
 	return nil
@@ -1166,7 +1229,7 @@ func (nc *Controller) handleDisruption(ctx context.Context, zoneToNodeConditions
 	if !allAreFullyDisrupted || !allWasFullyDisrupted {
 		// We're switching to full disruption mode
 		if allAreFullyDisrupted {
-			klog.V(0).Info("Controller detected that all Nodes are not-Ready. Entering master disruption mode.")
+			klog.Info("Controller detected that all Nodes are not-Ready. Entering master disruption mode.")
 			for i := range nodes {
 				if nc.runTaintManager {
 					_, err := nc.markNodeAsReachable(ctx, nodes[i])
@@ -1193,7 +1256,7 @@ func (nc *Controller) handleDisruption(ctx context.Context, zoneToNodeConditions
 		}
 		// We're exiting full disruption mode
 		if allWasFullyDisrupted {
-			klog.V(0).Info("Controller detected that some Nodes are Ready. Exiting master disruption mode.")
+			klog.Info("Controller detected that some Nodes are Ready. Exiting master disruption mode.")
 			// When exiting disruption mode update probe timestamps on all Nodes.
 			now := nc.now()
 			for i := range nodes {
@@ -1216,7 +1279,7 @@ func (nc *Controller) handleDisruption(ctx context.Context, zoneToNodeConditions
 			if v == newState {
 				continue
 			}
-			klog.V(0).Infof("Controller detected that zone %v is now in state %v.", k, newState)
+			klog.Infof("Controller detected that zone %v is now in state %v.", k, newState)
 			nc.setLimiterInZone(k, len(zoneToNodeConditions[k]), newState)
 			nc.zoneStates[k] = newState
 		}
@@ -1335,9 +1398,9 @@ func (nc *Controller) setLimiterInZone(zone string, zoneSize int, state ZoneStat
 }
 
 // classifyNodes classifies the allNodes to three categories:
-//   1. added: the nodes that in 'allNodes', but not in 'knownNodeSet'
-//   2. deleted: the nodes that in 'knownNodeSet', but not in 'allNodes'
-//   3. newZoneRepresentatives: the nodes that in both 'knownNodeSet' and 'allNodes', but no zone states
+//  1. added: the nodes that in 'allNodes', but not in 'knownNodeSet'
+//  2. deleted: the nodes that in 'knownNodeSet', but not in 'allNodes'
+//  3. newZoneRepresentatives: the nodes that in both 'knownNodeSet' and 'allNodes', but no zone states
 func (nc *Controller) classifyNodes(allNodes []*v1.Node) (added, deleted, newZoneRepresentatives []*v1.Node) {
 	for i := range allNodes {
 		if _, has := nc.knownNodeSet[allNodes[i].Name]; !has {
@@ -1410,11 +1473,11 @@ func (nc *Controller) addPodEvictorForNewZone(node *v1.Node) {
 // returns true if an eviction was queued.
 func (nc *Controller) cancelPodEviction(node *v1.Node) bool {
 	zone := nodetopology.GetZoneKey(node)
-	nc.evictorLock.Lock()
-	defer nc.evictorLock.Unlock()
 	if !nc.nodeEvictionMap.setStatus(node.Name, unmarked) {
 		klog.V(2).Infof("node %v was unregistered in the meantime - skipping setting status", node.Name)
 	}
+	nc.evictorLock.Lock()
+	defer nc.evictorLock.Unlock()
 	wasDeleting := nc.zonePodEvictor[zone].Remove(node.Name)
 	if wasDeleting {
 		klog.V(2).Infof("Cancelling pod Eviction on Node: %v", node.Name)
@@ -1424,13 +1487,11 @@ func (nc *Controller) cancelPodEviction(node *v1.Node) bool {
 }
 
 // evictPods:
-// - adds node to evictor queue if the node is not marked as evicted.
-//   Returns false if the node name was already enqueued.
-// - deletes pods immediately if node is already marked as evicted.
-//   Returns false, because the node wasn't added to the queue.
+//   - adds node to evictor queue if the node is not marked as evicted.
+//     Returns false if the node name was already enqueued.
+//   - deletes pods immediately if node is already marked as evicted.
+//     Returns false, because the node wasn't added to the queue.
 func (nc *Controller) evictPods(ctx context.Context, node *v1.Node, pods []*v1.Pod) (bool, error) {
-	nc.evictorLock.Lock()
-	defer nc.evictorLock.Unlock()
 	status, ok := nc.nodeEvictionMap.getStatus(node.Name)
 	if ok && status == evicted {
 		// Node eviction already happened for this node.
@@ -1444,6 +1505,10 @@ func (nc *Controller) evictPods(ctx context.Context, node *v1.Node, pods []*v1.P
 	if !nc.nodeEvictionMap.setStatus(node.Name, toBeEvicted) {
 		klog.V(2).Infof("node %v was unregistered in the meantime - skipping setting status", node.Name)
 	}
+
+	nc.evictorLock.Lock()
+	defer nc.evictorLock.Unlock()
+
 	return nc.zonePodEvictor[nodetopology.GetZoneKey(node)].Add(node.Name, string(node.UID)), nil
 }
 
@@ -1466,8 +1531,6 @@ func (nc *Controller) markNodeForTainting(node *v1.Node, status v1.ConditionStat
 }
 
 func (nc *Controller) markNodeAsReachable(ctx context.Context, node *v1.Node) (bool, error) {
-	nc.evictorLock.Lock()
-	defer nc.evictorLock.Unlock()
 	err := controller.RemoveTaintOffNode(ctx, nc.kubeClient, node.Name, node, UnreachableTaintTemplate)
 	if err != nil {
 		klog.Errorf("Failed to remove taint from node %v: %v", node.Name, err)
@@ -1478,6 +1541,9 @@ func (nc *Controller) markNodeAsReachable(ctx context.Context, node *v1.Node) (b
 		klog.Errorf("Failed to remove taint from node %v: %v", node.Name, err)
 		return false, err
 	}
+	nc.evictorLock.Lock()
+	defer nc.evictorLock.Unlock()
+
 	return nc.zoneNoExecuteTainter[nodetopology.GetZoneKey(node)].Remove(node.Name), nil
 }
 

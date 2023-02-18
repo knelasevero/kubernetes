@@ -44,7 +44,7 @@ const (
 var (
 	zeroDuration = metav1.Duration{}
 	// TODO: Move these constants to k8s.io/kubelet/config/v1beta1 instead?
-	// Refer to [Node Allocatable](https://git.k8s.io/community/contributors/design-proposals/node/node-allocatable.md) doc for more information.
+	// Refer to [Node Allocatable](https://git.k8s.io/design-proposals-archive/node/node-allocatable.md) doc for more information.
 	DefaultNodeAllocatableEnforcement = []string{"pods"}
 )
 
@@ -208,9 +208,6 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	if obj.SerializeImagePulls == nil {
 		obj.SerializeImagePulls = utilpointer.BoolPtr(true)
 	}
-	if obj.EvictionHard == nil {
-		obj.EvictionHard = DefaultEvictionHard
-	}
 	if obj.EvictionPressureTransitionPeriod == zeroDuration {
 		obj.EvictionPressureTransitionPeriod = metav1.Duration{Duration: 5 * time.Minute}
 	}
@@ -263,5 +260,11 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	}
 	if obj.RegisterNode == nil {
 		obj.RegisterNode = utilpointer.BoolPtr(true)
+	}
+	if obj.LocalStorageCapacityIsolation == nil {
+		obj.LocalStorageCapacityIsolation = utilpointer.BoolPtr(true)
+	}
+	if obj.ContainerRuntimeEndpoint == "" {
+		obj.ContainerRuntimeEndpoint = "unix:///run/containerd/containerd.sock"
 	}
 }

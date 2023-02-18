@@ -41,7 +41,7 @@ func TestValidatePodDisruptionBudgetSpec(t *testing.T) {
 		MinAvailable:   &minAvailable,
 		MaxUnavailable: &maxUnavailable,
 	}
-	errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+	errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 	if len(errs) == 0 {
 		t.Errorf("unexpected success for %v", spec)
 	}
@@ -60,7 +60,7 @@ func TestValidateMinAvailablePodDisruptionBudgetSpec(t *testing.T) {
 		spec := policy.PodDisruptionBudgetSpec{
 			MinAvailable: &c,
 		}
-		errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+		errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 		if len(errs) != 0 {
 			t.Errorf("unexpected failure %v for %v", errs, spec)
 		}
@@ -77,7 +77,7 @@ func TestValidateMinAvailablePodDisruptionBudgetSpec(t *testing.T) {
 		spec := policy.PodDisruptionBudgetSpec{
 			MinAvailable: &c,
 		}
-		errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+		errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 		if len(errs) == 0 {
 			t.Errorf("unexpected success for %v", spec)
 		}
@@ -92,9 +92,66 @@ func TestValidateMinAvailablePodAndMaxUnavailableDisruptionBudgetSpec(t *testing
 		MinAvailable:   &c1,
 		MaxUnavailable: &c2,
 	}
-	errs := ValidatePodDisruptionBudgetSpec(spec, field.NewPath("foo"))
+	errs := ValidatePodDisruptionBudgetSpec(spec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
 	if len(errs) == 0 {
 		t.Errorf("unexpected success for %v", spec)
+	}
+}
+
+func TestValidateUnhealthyPodEvictionPolicyDisruptionBudgetSpec(t *testing.T) {
+	c1 := intstr.FromString("10%")
+	alwaysAllowPolicy := policy.AlwaysAllow
+	invalidPolicy := policy.UnhealthyPodEvictionPolicyType("Invalid")
+
+	testCases := []struct {
+		name      string
+		pdbSpec   policy.PodDisruptionBudgetSpec
+		expectErr bool
+	}{
+		{
+			name: "valid nil UnhealthyPodEvictionPolicy",
+			pdbSpec: policy.PodDisruptionBudgetSpec{
+				MinAvailable:               &c1,
+				UnhealthyPodEvictionPolicy: nil,
+			},
+			expectErr: false,
+		},
+		{
+			name: "valid UnhealthyPodEvictionPolicy",
+			pdbSpec: policy.PodDisruptionBudgetSpec{
+				MinAvailable:               &c1,
+				UnhealthyPodEvictionPolicy: &alwaysAllowPolicy,
+			},
+			expectErr: false,
+		},
+		{
+			name: "empty UnhealthyPodEvictionPolicy",
+			pdbSpec: policy.PodDisruptionBudgetSpec{
+				MinAvailable:               &c1,
+				UnhealthyPodEvictionPolicy: new(policy.UnhealthyPodEvictionPolicyType),
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid UnhealthyPodEvictionPolicy",
+			pdbSpec: policy.PodDisruptionBudgetSpec{
+				MinAvailable:               &c1,
+				UnhealthyPodEvictionPolicy: &invalidPolicy,
+			},
+			expectErr: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidatePodDisruptionBudgetSpec(tc.pdbSpec, PodDisruptionBudgetValidationOptions{true}, field.NewPath("foo"))
+			if len(errs) == 0 && tc.expectErr {
+				t.Errorf("unexpected success for %v", tc.pdbSpec)
+			}
+			if len(errs) != 0 && !tc.expectErr {
+				t.Errorf("unexpected failure for %v", tc.pdbSpec)
+			}
+		})
 	}
 }
 
@@ -524,12 +581,12 @@ func TestValidatePodSecurityPolicy(t *testing.T) {
 		"invalid allowed unsafe sysctl pattern": {
 			psp:         invalidAllowedUnsafeSysctlPattern,
 			errorType:   field.ErrorTypeInvalid,
-			errorDetail: fmt.Sprintf("must have at most 253 characters and match regex %s", SysctlPatternFmt),
+			errorDetail: fmt.Sprintf("must have at most 253 characters and match regex %s", SysctlContainSlashPatternFmt),
 		},
 		"invalid forbidden sysctl pattern": {
 			psp:         invalidForbiddenSysctlPattern,
 			errorType:   field.ErrorTypeInvalid,
-			errorDetail: fmt.Sprintf("must have at most 253 characters and match regex %s", SysctlPatternFmt),
+			errorDetail: fmt.Sprintf("must have at most 253 characters and match regex %s", SysctlContainSlashPatternFmt),
 		},
 		"invalid overlapping sysctl pattern": {
 			psp:         invalidOverlappingSysctls,
@@ -805,6 +862,12 @@ func TestIsValidSysctlPattern(t *testing.T) {
 		"abc*",
 		"a.abc*",
 		"a.b.*",
+		"a/b/c/d",
+		"a/*",
+		"a/b/*",
+		"a.b/c*",
+		"a.b/c.d",
+		"a/b.c/d",
 	}
 	invalid := []string{
 		"",
@@ -823,6 +886,10 @@ func TestIsValidSysctlPattern(t *testing.T) {
 		"a*b",
 		"*a",
 		"Abc",
+		"/",
+		"a/",
+		"/a",
+		"a*/b",
 		func(n int) string {
 			x := make([]byte, n)
 			for i := range x {
@@ -832,12 +899,12 @@ func TestIsValidSysctlPattern(t *testing.T) {
 		}(256),
 	}
 	for _, s := range valid {
-		if !IsValidSysctlPattern(s, false) {
+		if !IsValidSysctlPattern(s) {
 			t.Errorf("%q expected to be a valid sysctl pattern", s)
 		}
 	}
 	for _, s := range invalid {
-		if IsValidSysctlPattern(s, false) {
+		if IsValidSysctlPattern(s) {
 			t.Errorf("%q expected to be an invalid sysctl pattern", s)
 		}
 	}
@@ -997,13 +1064,13 @@ func TestValidateRuntimeClassStrategy(t *testing.T) {
 	}, {
 		name: "valid defaulting & allow all",
 		strategy: &policy.RuntimeClassStrategyOptions{
-			DefaultRuntimeClassName:  pointer.StringPtr("native"),
+			DefaultRuntimeClassName:  pointer.String("native"),
 			AllowedRuntimeClassNames: []string{"*"},
 		},
 	}, {
 		name: "valid defaulting & allow explicit",
 		strategy: &policy.RuntimeClassStrategyOptions{
-			DefaultRuntimeClassName:  pointer.StringPtr("native"),
+			DefaultRuntimeClassName:  pointer.String("native"),
 			AllowedRuntimeClassNames: []string{"foo", "native", "sandboxed"},
 		},
 	}, {
@@ -1014,20 +1081,20 @@ func TestValidateRuntimeClassStrategy(t *testing.T) {
 	}, {
 		name: "invalid default name",
 		strategy: &policy.RuntimeClassStrategyOptions{
-			DefaultRuntimeClassName: pointer.StringPtr("foo bar"),
+			DefaultRuntimeClassName: pointer.String("foo bar"),
 		},
 		expectErrors: true,
 	}, {
 		name: "disallowed default",
 		strategy: &policy.RuntimeClassStrategyOptions{
-			DefaultRuntimeClassName:  pointer.StringPtr("foo"),
+			DefaultRuntimeClassName:  pointer.String("foo"),
 			AllowedRuntimeClassNames: []string{"native", "sandboxed"},
 		},
 		expectErrors: true,
 	}, {
 		name: "nothing allowed default",
 		strategy: &policy.RuntimeClassStrategyOptions{
-			DefaultRuntimeClassName: pointer.StringPtr("foo"),
+			DefaultRuntimeClassName: pointer.String("foo"),
 		},
 		expectErrors: true,
 	}, {

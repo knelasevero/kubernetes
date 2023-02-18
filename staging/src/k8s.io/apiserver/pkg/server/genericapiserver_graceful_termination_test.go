@@ -79,7 +79,7 @@ func (w *wrappedLifecycleSignal) Signal() {
 	}
 }
 
-func wrapLifecycleSignalsWithRecorer(t *testing.T, signals *lifecycleSignals, before func(lifecycleSignal)) {
+func wrapLifecycleSignalsWithRecorder(t *testing.T, signals *lifecycleSignals, before func(lifecycleSignal)) {
 	// it's important to record the signal being fired on a 'before' callback
 	// to avoid flakes, since on the server the signaling of events are
 	// an asynchronous process.
@@ -120,57 +120,56 @@ func newSignalInterceptingTestStep() *signalInterceptingTestStep {
 	}
 }
 
-//  This test exercises the graceful termination scenario
-//  described in the following diagram
-//    - every vertical line is an independent timeline
-//    - the leftmost vertical line represents the go routine that
-//      is executing GenericAPIServer.Run methos
-//    - (signal name) indicates that the given lifecycle signal has been fired
+//	 This test exercises the graceful termination scenario
+//	 described in the following diagram
+//	   - every vertical line is an independent timeline
+//	   - the leftmost vertical line represents the go routine that
+//	     is executing GenericAPIServer.Run method
+//	   - (signal name) indicates that the given lifecycle signal has been fired
 //
-//                                  stopCh
-//                                    |
-//              |--------------------------------------------|
-//              |                                            |
-// 	    call PreShutdownHooks                        (ShutdownInitiated)
-//              |                                            |
-//   (PreShutdownHooksStopped)                   Sleep(ShutdownDelayDuration)
-//              |                                            |
-//              |                                 (AfterShutdownDelayDuration)
-//              |                                            |
-//              |                                            |
-//              |--------------------------------------------|
-//              |                                            |
-//              |                                 (NotAcceptingNewRequest)
-//              |                                            |
-//              |                       |-------------------------------------------------|
-//              |                       |                                                 |
-//              |             close(stopHttpServerCh)                         HandlerChainWaitGroup.Wait()
-//              |                       |                                                 |
-//              |            server.Shutdown(timeout=60s)                                 |
-//              |                       |                                                 |
-//              |              stop listener (net/http)                                   |
-//              |                       |                                                 |
-//              |          |-------------------------------------|                        |
-//              |          |                                     |                        |
-//              |          |                      (HTTPServerStoppedListening)            |
-//              |          |                                                              |
-//              |    wait up to 60s                                                       |
-//              |          |                                                  (InFlightRequestsDrained)
-//              |          |
-//              |          |
-//              |	stoppedCh is closed
-//              |
-//              |
-//    <-drainedCh.Signaled()
-//              |
-//   s.AuditBackend.Shutdown()
-//              |
-//      <-listenerStoppedCh
-//              |
-//         <-stoppedCh
-//              |
-//          return nil
-//
+//	                                 stopCh
+//	                                   |
+//	             |--------------------------------------------|
+//	             |                                            |
+//		    call PreShutdownHooks                        (ShutdownInitiated)
+//	             |                                            |
+//	  (PreShutdownHooksStopped)                   Sleep(ShutdownDelayDuration)
+//	             |                                            |
+//	             |                                 (AfterShutdownDelayDuration)
+//	             |                                            |
+//	             |                                            |
+//	             |--------------------------------------------|
+//	             |                                            |
+//	             |                                 (NotAcceptingNewRequest)
+//	             |                                            |
+//	             |                       |-------------------------------------------------|
+//	             |                       |                                                 |
+//	             |             close(stopHttpServerCh)                         NonLongRunningRequestWaitGroup.Wait()
+//	             |                       |                                                 |
+//	             |            server.Shutdown(timeout=60s)                                 |
+//	             |                       |                                                 |
+//	             |              stop listener (net/http)                                   |
+//	             |                       |                                                 |
+//	             |          |-------------------------------------|                        |
+//	             |          |                                     |                        |
+//	             |          |                      (HTTPServerStoppedListening)            |
+//	             |          |                                                              |
+//	             |    wait up to 60s                                                       |
+//	             |          |                                                  (InFlightRequestsDrained)
+//	             |          |
+//	             |          |
+//	             |	stoppedCh is closed
+//	             |
+//	             |
+//	   <-drainedCh.Signaled()
+//	             |
+//	  s.AuditBackend.Shutdown()
+//	             |
+//	     <-listenerStoppedCh
+//	             |
+//	        <-stoppedCh
+//	             |
+//	         return nil
 func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationDisabled(t *testing.T) {
 	fakeAudit := &fakeAudit{}
 	s := newGenericAPIServer(t, fakeAudit, false)
@@ -186,7 +185,7 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationDisabled(t
 
 	signals := &s.lifecycleSignals
 	recorder := &signalRecorder{}
-	wrapLifecycleSignalsWithRecorer(t, signals, recorder.before)
+	wrapLifecycleSignalsWithRecorder(t, signals, recorder.before)
 
 	// before the AfterShutdownDelayDuration signal is fired, we want
 	// the test to execute a verification step.
@@ -333,50 +332,52 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationDisabled(t
 	}
 }
 
-//  This test exercises the graceful termination scenario
-//  described in the following diagram
-//    - every vertical line is an independent timeline
-//    - the leftmost vertical line represents the go routine that
-//      is executing GenericAPIServer.Run method
-//    - (signal) indicates that the given lifecycle signal has been fired
+// This test exercises the graceful termination scenario
+// described in the following diagram
 //
-//                                  stopCh
-//                                    |
-//              |--------------------------------------------|
-//              |                                            |
-//      call PreShutdownHooks                       (ShutdownInitiated)
-//              |                                            |
-//   (PreShutdownHooksCompleted)                  Sleep(ShutdownDelayDuration)
-//              |                                            |
-//              |                                 (AfterShutdownDelayDuration)
-//              |                                            |
-//              |                                            |
-//              |--------------------------------------------|
-//              |                                            |
-//              |                               (NotAcceptingNewRequest)
-//              |                                            |
-//              |                              HandlerChainWaitGroup.Wait()
-//              |                                            |
-//              |                                (InFlightRequestsDrained)
-//              |                                            |
-//              |                                            |
-//              |------------------------------------------------------------|
-//              |                                                            |
-//      <-drainedCh.Signaled()                                     close(stopHttpServerCh)
-//              |                                                            |
+//   - every vertical line is an independent timeline
+//
+//   - the leftmost vertical line represents the go routine that
+//     is executing GenericAPIServer.Run method
+//
+//   - (signal) indicates that the given lifecycle signal has been fired
+//
+//     stopCh
+//     |
+//     |--------------------------------------------|
+//     |                                            |
+//     call PreShutdownHooks                       (ShutdownInitiated)
+//     |                                            |
+//     (PreShutdownHooksCompleted)                  Sleep(ShutdownDelayDuration)
+//     |                                            |
+//     |                                 (AfterShutdownDelayDuration)
+//     |                                            |
+//     |                                            |
+//     |--------------------------------------------|
+//     |                                            |
+//     |                               (NotAcceptingNewRequest)
+//     |                                            |
+//     |                              NonLongRunningRequestWaitGroup.Wait()
+//     |                                            |
+//     |                                (InFlightRequestsDrained)
+//     |                                            |
+//     |                                            |
+//     |------------------------------------------------------------|
+//     |                                                            |
+//     <-drainedCh.Signaled()                                     close(stopHttpServerCh)
+//     |                                                            |
 //     s.AuditBackend.Shutdown()                                 server.Shutdown(timeout=2s)
-//              |                                                            |
-//              |                                                   stop listener (net/http)
-//              |                                                            |
-//              |                                         |-------------------------------------|
-//              |                                         |                                     |
-//              |                                   wait up to 2s                 (HTTPServerStoppedListening)
+//     |                                                            |
+//     |                                                   stop listener (net/http)
+//     |                                                            |
+//     |                                         |-------------------------------------|
+//     |                                         |                                     |
+//     |                                   wait up to 2s                 (HTTPServerStoppedListening)
 //     <-listenerStoppedCh                                |
-//              |                                stoppedCh is closed
-//         <-stoppedCh
-//              |
-//          return nil
-//
+//     |                                stoppedCh is closed
+//     <-stoppedCh
+//     |
+//     return nil
 func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationEnabled(t *testing.T) {
 	fakeAudit := &fakeAudit{}
 	s := newGenericAPIServer(t, fakeAudit, true)
@@ -392,7 +393,7 @@ func TestGracefulTerminationWithKeepListeningDuringGracefulTerminationEnabled(t 
 
 	signals := &s.lifecycleSignals
 	recorder := &signalRecorder{}
-	wrapLifecycleSignalsWithRecorer(t, signals, recorder.before)
+	wrapLifecycleSignalsWithRecorder(t, signals, recorder.before)
 
 	// before the AfterShutdownDelayDuration signal is fired, we want
 	// the test to execute a verification step.
@@ -779,10 +780,9 @@ func (a *fakeAudit) requestAudited(auditID string) bool {
 	return exists
 }
 
-func (a *fakeAudit) EvaluatePolicyRule(attrs authorizer.Attributes) audit.RequestAuditConfigWithLevel {
-	return audit.RequestAuditConfigWithLevel{
-		Level:              auditinternal.LevelMetadata,
-		RequestAuditConfig: audit.RequestAuditConfig{},
+func (a *fakeAudit) EvaluatePolicyRule(attrs authorizer.Attributes) audit.RequestAuditConfig {
+	return audit.RequestAuditConfig{
+		Level: auditinternal.LevelMetadata,
 	}
 }
 
@@ -857,7 +857,7 @@ func waitForAPIServerStarted(t *testing.T, doer doer) {
 	client := newClient(true)
 	i := 1
 	err := wait.PollImmediate(100*time.Millisecond, 5*time.Second, func() (done bool, err error) {
-		result := doer.Do(client, func(httptrace.GotConnInfo) {}, fmt.Sprintf("/echo?message=attempt-%d", i), 100*time.Millisecond)
+		result := doer.Do(client, func(httptrace.GotConnInfo) {}, fmt.Sprintf("/echo?message=attempt-%d", i), time.Second)
 		i++
 
 		if result.err != nil {

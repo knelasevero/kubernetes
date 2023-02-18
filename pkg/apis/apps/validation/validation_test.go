@@ -86,6 +86,8 @@ func TestValidateStatefulSet(t *testing.T) {
 
 	const enableStatefulSetAutoDeletePVC = "[enable StatefulSetAutoDeletePVC]"
 
+	const enableStatefulSetStartOrdinal = "[enable StatefulSetStartOrdinal]"
+
 	type testCase struct {
 		name string
 		set  apps.StatefulSet
@@ -193,11 +195,25 @@ func TestValidateStatefulSet(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "ordinals.start positive value " + enableStatefulSetStartOrdinal,
+			set: apps.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc-123", Namespace: metav1.NamespaceDefault},
+				Spec: apps.StatefulSetSpec{
+					PodManagementPolicy: apps.ParallelPodManagement,
+					UpdateStrategy:      apps.StatefulSetUpdateStrategy{Type: apps.RollingUpdateStatefulSetStrategyType},
+					Selector:            &metav1.LabelSelector{MatchLabels: validLabels},
+					Template:            validPodTemplate.Template,
+					Replicas:            3,
+					Ordinals:            &apps.StatefulSetOrdinals{Start: 2},
+				},
+			},
+		},
 	}
 
 	errorCases := []testCase{
 		{
-			name: "zero-length ID",
+			name: "zero-length name",
 			set: apps.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{Name: "", Namespace: metav1.NamespaceDefault},
 				Spec: apps.StatefulSetSpec{
@@ -209,6 +225,36 @@ func TestValidateStatefulSet(t *testing.T) {
 			},
 			errs: field.ErrorList{
 				field.Required(field.NewPath("metadata", "name"), ""),
+			},
+		},
+		{
+			name: "name-with-dots",
+			set: apps.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc.123", Namespace: metav1.NamespaceDefault},
+				Spec: apps.StatefulSetSpec{
+					PodManagementPolicy: apps.OrderedReadyPodManagement,
+					Selector:            &metav1.LabelSelector{MatchLabels: validLabels},
+					Template:            validPodTemplate.Template,
+					UpdateStrategy:      apps.StatefulSetUpdateStrategy{Type: apps.RollingUpdateStatefulSetStrategyType},
+				},
+			},
+			errs: field.ErrorList{
+				field.Invalid(field.NewPath("metadata", "name"), "abc.123", ""),
+			},
+		},
+		{
+			name: "long name",
+			set: apps.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("a", 64), Namespace: metav1.NamespaceDefault},
+				Spec: apps.StatefulSetSpec{
+					PodManagementPolicy: apps.OrderedReadyPodManagement,
+					Selector:            &metav1.LabelSelector{MatchLabels: validLabels},
+					Template:            validPodTemplate.Template,
+					UpdateStrategy:      apps.StatefulSetUpdateStrategy{Type: apps.RollingUpdateStatefulSetStrategyType},
+				},
+			},
+			errs: field.ErrorList{
+				field.Invalid(field.NewPath("metadata", "name"), strings.Repeat("a", 64), ""),
 			},
 		},
 		{
@@ -635,6 +681,23 @@ func TestValidateStatefulSet(t *testing.T) {
 				field.Invalid(field.NewPath("spec", "updateStrategy", "rollingUpdate", "maxUnavailable"), nil, ""),
 			},
 		},
+		{
+			name: "invalid ordinals.start " + enableStatefulSetStartOrdinal,
+			set: apps.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc-123", Namespace: metav1.NamespaceDefault},
+				Spec: apps.StatefulSetSpec{
+					PodManagementPolicy: apps.ParallelPodManagement,
+					UpdateStrategy:      apps.StatefulSetUpdateStrategy{Type: apps.RollingUpdateStatefulSetStrategyType},
+					Selector:            &metav1.LabelSelector{MatchLabels: validLabels},
+					Template:            validPodTemplate.Template,
+					Replicas:            3,
+					Ordinals:            &apps.StatefulSetOrdinals{Start: -2},
+				},
+			},
+			errs: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "ordinals.start"), nil, ""),
+			},
+		},
 	}
 
 	cmpOpts := []cmp.Option{cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail"), cmpopts.SortSlices(func(a, b *field.Error) bool { return a.Error() < b.Error() })}
@@ -650,6 +713,9 @@ func TestValidateStatefulSet(t *testing.T) {
 		t.Run(testTitle, func(t *testing.T) {
 			if strings.Contains(name, enableStatefulSetAutoDeletePVC) {
 				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetAutoDeletePVC, true)()
+			}
+			if strings.Contains(name, enableStatefulSetStartOrdinal) {
+				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetStartOrdinal, true)()
 			}
 
 			errs := ValidateStatefulSet(&testCase.set, pod.GetValidationOptionsFromPodTemplate(&testCase.set.Spec.Template, nil))
@@ -690,39 +756,28 @@ func generateStatefulSetSpec(minSeconds int32) *apps.StatefulSetSpec {
 // TestValidateStatefulSetMinReadySeconds tests the StatefulSet Spec's minReadySeconds field
 func TestValidateStatefulSetMinReadySeconds(t *testing.T) {
 	testCases := map[string]struct {
-		ss                    *apps.StatefulSetSpec
-		enableMinReadySeconds bool
-		expectErr             bool
+		ss        *apps.StatefulSetSpec
+		expectErr bool
 	}{
 		"valid : minReadySeconds enabled, zero": {
-			ss:                    generateStatefulSetSpec(0),
-			enableMinReadySeconds: true,
-			expectErr:             false,
+			ss:        generateStatefulSetSpec(0),
+			expectErr: false,
 		},
 		"invalid : minReadySeconds enabled, negative": {
-			ss:                    generateStatefulSetSpec(-1),
-			enableMinReadySeconds: true,
-			expectErr:             true,
+			ss:        generateStatefulSetSpec(-1),
+			expectErr: true,
 		},
 		"valid : minReadySeconds enabled, very large value": {
-			ss:                    generateStatefulSetSpec(2147483647),
-			enableMinReadySeconds: true,
-			expectErr:             false,
+			ss:        generateStatefulSetSpec(2147483647),
+			expectErr: false,
 		},
 		"invalid : minReadySeconds enabled, large negative": {
-			ss:                    generateStatefulSetSpec(-2147483648),
-			enableMinReadySeconds: true,
-			expectErr:             true,
-		},
-		"valid : minReadySeconds disabled, we don't validate anything": {
-			ss:                    generateStatefulSetSpec(-2147483648),
-			enableMinReadySeconds: false,
-			expectErr:             false,
+			ss:        generateStatefulSetSpec(-2147483648),
+			expectErr: true,
 		},
 	}
 	for tcName, tc := range testCases {
 		t.Run(tcName, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetMinReadySeconds, tc.enableMinReadySeconds)()
 			errs := ValidateStatefulSetSpec(tc.ss, field.NewPath("spec", "minReadySeconds"),
 				corevalidation.PodValidationOptions{})
 			if tc.expectErr && len(errs) == 0 {
@@ -739,16 +794,15 @@ func TestValidateStatefulSetStatus(t *testing.T) {
 	observedGenerationMinusOne := int64(-1)
 	collisionCountMinusOne := int32(-1)
 	tests := []struct {
-		name                  string
-		replicas              int32
-		readyReplicas         int32
-		currentReplicas       int32
-		updatedReplicas       int32
-		availableReplicas     int32
-		enableMinReadySeconds bool
-		observedGeneration    *int64
-		collisionCount        *int32
-		expectedErr           bool
+		name               string
+		replicas           int32
+		readyReplicas      int32
+		currentReplicas    int32
+		updatedReplicas    int32
+		availableReplicas  int32
+		observedGeneration *int64
+		collisionCount     *int32
+		expectedErr        bool
 	}{
 		{
 			name:            "valid status",
@@ -833,64 +887,33 @@ func TestValidateStatefulSetStatus(t *testing.T) {
 			expectedErr:     true,
 		},
 		{
-			name:                  "invalid: number of available replicas",
-			replicas:              3,
-			readyReplicas:         3,
-			currentReplicas:       2,
-			availableReplicas:     int32(-1),
-			expectedErr:           true,
-			enableMinReadySeconds: true,
+			name:              "invalid: number of available replicas",
+			replicas:          3,
+			readyReplicas:     3,
+			currentReplicas:   2,
+			availableReplicas: int32(-1),
+			expectedErr:       true,
 		},
 		{
-			name:                  "invalid: available replicas greater than replicas",
-			replicas:              3,
-			readyReplicas:         3,
-			currentReplicas:       2,
-			availableReplicas:     int32(4),
-			expectedErr:           true,
-			enableMinReadySeconds: true,
+			name:              "invalid: available replicas greater than replicas",
+			replicas:          3,
+			readyReplicas:     3,
+			currentReplicas:   2,
+			availableReplicas: int32(4),
+			expectedErr:       true,
 		},
 		{
-			name:                  "invalid: available replicas greater than ready replicas",
-			replicas:              3,
-			readyReplicas:         2,
-			currentReplicas:       2,
-			availableReplicas:     int32(3),
-			expectedErr:           true,
-			enableMinReadySeconds: true,
-		},
-		{
-			name:                  "minReadySeconds flag not set, no validation: number of available replicas",
-			replicas:              3,
-			readyReplicas:         3,
-			currentReplicas:       2,
-			availableReplicas:     int32(-1),
-			expectedErr:           false,
-			enableMinReadySeconds: false,
-		},
-		{
-			name:                  "minReadySeconds flag not set, no validation: available replicas greater than replicas",
-			replicas:              3,
-			readyReplicas:         3,
-			currentReplicas:       2,
-			availableReplicas:     int32(4),
-			expectedErr:           false,
-			enableMinReadySeconds: false,
-		},
-		{
-			name:                  "minReadySeconds flag not set, no validation: available replicas greater than ready replicas",
-			replicas:              3,
-			readyReplicas:         2,
-			currentReplicas:       2,
-			availableReplicas:     int32(3),
-			expectedErr:           false,
-			enableMinReadySeconds: false,
+			name:              "invalid: available replicas greater than ready replicas",
+			replicas:          3,
+			readyReplicas:     2,
+			currentReplicas:   2,
+			availableReplicas: int32(3),
+			expectedErr:       true,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetMinReadySeconds, test.enableMinReadySeconds)()
 			status := apps.StatefulSetStatus{
 				Replicas:           test.replicas,
 				ReadyReplicas:      test.readyReplicas,
@@ -1167,6 +1190,27 @@ func TestValidateStatefulSetUpdate(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "update existing instance with now-invalid name",
+			old: apps.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc.123.example", Namespace: metav1.NamespaceDefault, Finalizers: []string{"final"}},
+				Spec: apps.StatefulSetSpec{
+					PodManagementPolicy: apps.OrderedReadyPodManagement,
+					Selector:            &metav1.LabelSelector{MatchLabels: validLabels},
+					Template:            validPodTemplate.Template,
+					UpdateStrategy:      apps.StatefulSetUpdateStrategy{Type: apps.RollingUpdateStatefulSetStrategyType},
+				},
+			},
+			update: apps.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc.123.example", Namespace: metav1.NamespaceDefault, Finalizers: []string{}},
+				Spec: apps.StatefulSetSpec{
+					PodManagementPolicy: apps.OrderedReadyPodManagement,
+					Selector:            &metav1.LabelSelector{MatchLabels: validLabels},
+					Template:            validPodTemplate.Template,
+					UpdateStrategy:      apps.StatefulSetUpdateStrategy{Type: apps.RollingUpdateStatefulSetStrategyType},
+				},
+			},
+		},
 	}
 
 	errorCases := []testCase{
@@ -1394,7 +1438,11 @@ func TestValidateStatefulSetUpdate(t *testing.T) {
 		},
 	}
 
-	cmpOpts := []cmp.Option{cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail"), cmpopts.SortSlices(func(a, b *field.Error) bool { return a.Error() < b.Error() })}
+	cmpOpts := []cmp.Option{
+		cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail"),
+		cmpopts.SortSlices(func(a, b *field.Error) bool { return a.Error() < b.Error() }),
+		cmpopts.EquateEmpty(),
+	}
 	for _, testCase := range append(successCases, errorCases...) {
 		name := testCase.name
 		var testTitle string
@@ -2439,8 +2487,6 @@ func TestValidateDaemonSetUpdate(t *testing.T) {
 }
 
 func TestValidateDaemonSet(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
-
 	validSelector := map[string]string{"a": "b"}
 	validPodTemplate := api.PodTemplate{
 		Template: api.PodTemplateSpec{
@@ -2703,8 +2749,6 @@ func validDeployment() *apps.Deployment {
 }
 
 func TestValidateDeployment(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
-
 	successCases := []*apps.Deployment{
 		validDeployment(),
 	}
@@ -3634,7 +3678,6 @@ func TestValidateReplicaSet(t *testing.T) {
 func TestDaemonSetUpdateMaxSurge(t *testing.T) {
 	testCases := map[string]struct {
 		ds          *apps.RollingUpdateDaemonSet
-		enableSurge bool
 		expectError bool
 	}{
 		"invalid: unset": {
@@ -3680,45 +3723,40 @@ func TestDaemonSetUpdateMaxSurge(t *testing.T) {
 				MaxUnavailable: intstr.FromString("1%"),
 				MaxSurge:       intstr.FromString("1%"),
 			},
+			expectError: true,
 		},
 
 		"invalid: surge enabled, unavailable zero percent": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxUnavailable: intstr.FromString("0%"),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 		"invalid: surge enabled, unavailable zero": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxUnavailable: intstr.FromInt(0),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 		"valid: surge enabled, unavailable one": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxUnavailable: intstr.FromInt(1),
 			},
-			enableSurge: true,
 		},
 		"valid: surge enabled, unavailable one percent": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxUnavailable: intstr.FromString("1%"),
 			},
-			enableSurge: true,
 		},
 		"valid: surge enabled, unavailable 100%": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxUnavailable: intstr.FromString("100%"),
 			},
-			enableSurge: true,
 		},
 		"invalid: surge enabled, unavailable greater than 100%": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxUnavailable: intstr.FromString("101%"),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 
@@ -3726,39 +3764,33 @@ func TestDaemonSetUpdateMaxSurge(t *testing.T) {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxSurge: intstr.FromString("0%"),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 		"invalid: surge enabled, surge zero": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxSurge: intstr.FromInt(0),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 		"valid: surge enabled, surge one": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxSurge: intstr.FromInt(1),
 			},
-			enableSurge: true,
 		},
 		"valid: surge enabled, surge one percent": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxSurge: intstr.FromString("1%"),
 			},
-			enableSurge: true,
 		},
 		"valid: surge enabled, surge 100%": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxSurge: intstr.FromString("100%"),
 			},
-			enableSurge: true,
 		},
 		"invalid: surge enabled, surge greater than 100%": {
 			ds: &apps.RollingUpdateDaemonSet{
 				MaxSurge: intstr.FromString("101%"),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 
@@ -3767,7 +3799,6 @@ func TestDaemonSetUpdateMaxSurge(t *testing.T) {
 				MaxUnavailable: intstr.FromString("1%"),
 				MaxSurge:       intstr.FromString("1%"),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 
@@ -3776,7 +3807,6 @@ func TestDaemonSetUpdateMaxSurge(t *testing.T) {
 				MaxUnavailable: intstr.FromString("0%"),
 				MaxSurge:       intstr.FromString("0%"),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 		"invalid: surge enabled, surge and unavailable zero": {
@@ -3784,7 +3814,6 @@ func TestDaemonSetUpdateMaxSurge(t *testing.T) {
 				MaxUnavailable: intstr.FromInt(0),
 				MaxSurge:       intstr.FromInt(0),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 		"invalid: surge enabled, surge and unavailable mixed zero": {
@@ -3792,13 +3821,11 @@ func TestDaemonSetUpdateMaxSurge(t *testing.T) {
 				MaxUnavailable: intstr.FromInt(0),
 				MaxSurge:       intstr.FromString("0%"),
 			},
-			enableSurge: true,
 			expectError: true,
 		},
 	}
 	for tcName, tc := range testCases {
 		t.Run(tcName, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.DaemonSetUpdateSurge, tc.enableSurge)()
 			errs := ValidateRollingUpdateDaemonSet(tc.ds, field.NewPath("spec", "updateStrategy", "rollingUpdate"))
 			if tc.expectError && len(errs) == 0 {
 				t.Errorf("Unexpected success")

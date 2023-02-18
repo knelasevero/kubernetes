@@ -29,13 +29,12 @@ import (
 	"syscall"
 	"time"
 
+	"go.uber.org/goleak"
 	"google.golang.org/grpc/grpclog"
 	"k8s.io/klog/v2"
 
 	"k8s.io/kubernetes/pkg/util/env"
 )
-
-var etcdURL = ""
 
 const installEtcd = `
 Cannot find etcd, cannot run integration tests
@@ -69,7 +68,7 @@ func startEtcd() (func(), error) {
 		os.Setenv("ETCD_UNSUPPORTED_ARCH", "arm64")
 	}
 
-	etcdURL = env.GetEnvAsStringOrFallback("KUBE_INTEGRATION_ETCD_URL", "http://127.0.0.1:2379")
+	etcdURL := env.GetEnvAsStringOrFallback("KUBE_INTEGRATION_ETCD_URL", "http://127.0.0.1:2379")
 	conn, err := net.Dial("tcp", strings.TrimPrefix(etcdURL, "http://"))
 	if err == nil {
 		klog.Infof("etcd already running at %s", etcdURL)
@@ -83,8 +82,7 @@ func startEtcd() (func(), error) {
 		return nil, err
 	}
 
-	etcdURL = currentURL
-	os.Setenv("KUBE_INTEGRATION_ETCD_URL", etcdURL)
+	os.Setenv("KUBE_INTEGRATION_ETCD_URL", currentURL)
 
 	return stop, nil
 }
@@ -184,34 +182,52 @@ func EtcdMain(tests func() int) {
 	// Bail out early when -help was given as parameter.
 	flag.Parse()
 
-	before := runtime.NumGoroutine()
+	// Must be called *before* creating new goroutines.
+	goleakOpts := IgnoreBackgroundGoroutines()
+
+	goleakOpts = append(goleakOpts,
+		// lumberjack leaks a goroutine:
+		// https://github.com/natefinch/lumberjack/issues/56 This affects tests
+		// using --audit-log-path (like
+		// ./test/integration/apiserver/admissionwebhook/reinvocation_test.go).
+		// In normal production that should be harmless. We don't know here
+		// whether the test is using that, so we have to suppress reporting
+		// this leak for all tests.
+		//
+		// Both names occurred in practice.
+		goleak.IgnoreTopFunction("k8s.io/kubernetes/vendor/gopkg.in/natefinch/lumberjack%2ev2.(*Logger).millRun"),
+		goleak.IgnoreTopFunction("gopkg.in/natefinch/lumberjack%2ev2.(*Logger).millRun"),
+	)
+
 	stop, err := startEtcd()
 	if err != nil {
 		klog.Fatalf("cannot run integration tests: unable to start etcd: %v", err)
 	}
 	result := tests()
 	stop() // Don't defer this. See os.Exit documentation.
+	klog.StopFlushDaemon()
 
-	// Log the number of goroutines leaked.
-	// TODO: we should work on reducing this as much as possible.
-	var dg int
-	for i := 0; i < 10; i++ {
-		// Leave some room for goroutines we can not get rid of
-		// like k8s.io/klog/v2.(*loggingT).flushDaemon()
-		// TODO: adjust this number based on a more exhaustive analysis.
-		if dg = runtime.NumGoroutine() - before; dg <= 4 {
-			os.Exit(result)
+	// Several tests don't wait for goroutines to stop. goleak.Find retries
+	// internally, but not long enough. 5 seconds seemed to be enough for
+	// most tests, even when testing in the CI.
+	timeout := 5 * time.Second
+	start := time.Now()
+	for {
+		err := goleak.Find(goleakOpts...)
+		if err == nil {
+			break
 		}
-		// Allow goroutines to schedule and die off.
-		runtime.Gosched()
-		time.Sleep(100 * time.Millisecond)
+		if time.Now().Sub(start) >= timeout {
+			klog.ErrorS(err, "EtcdMain goroutine check")
+			result = 1
+			break
+		}
 	}
-	after := runtime.NumGoroutine()
-	klog.Infof("unexpected number of goroutines: before: %d after %d", before, after)
+
 	os.Exit(result)
 }
 
 // GetEtcdURL returns the URL of the etcd instance started by EtcdMain.
 func GetEtcdURL() string {
-	return etcdURL
+	return env.GetEnvAsStringOrFallback("KUBE_INTEGRATION_ETCD_URL", "http://127.0.0.1:2379")
 }

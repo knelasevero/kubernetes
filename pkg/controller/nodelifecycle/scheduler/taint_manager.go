@@ -30,13 +30,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apiserver/pkg/util/feature"
+	corev1apply "k8s.io/client-go/applyconfigurations/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	"k8s.io/kubernetes/pkg/features"
 
 	"k8s.io/klog/v2"
 )
@@ -51,6 +55,9 @@ const (
 	UpdateWorkerSize     = 8
 	podUpdateChannelSize = 1
 	retries              = 5
+
+	// fieldManager used to add pod disruption condition when evicting pods due to NoExecute taint
+	fieldManager = "TaintManager"
 )
 
 type nodeUpdateItem struct {
@@ -69,12 +76,6 @@ func hash(val string, max int) int {
 	return int(hasher.Sum32() % uint32(max))
 }
 
-// GetPodFunc returns the pod for the specified name/namespace, or a NotFound error if missing.
-type GetPodFunc func(name, namespace string) (*v1.Pod, error)
-
-// GetNodeFunc returns the node for the specified name, or a NotFound error if missing.
-type GetNodeFunc func(name string) (*v1.Node, error)
-
 // GetPodsByNodeNameFunc returns the list of pods assigned to the specified node.
 type GetPodsByNodeNameFunc func(nodeName string) ([]*v1.Pod, error)
 
@@ -84,8 +85,8 @@ type NoExecuteTaintManager struct {
 	client                clientset.Interface
 	broadcaster           record.EventBroadcaster
 	recorder              record.EventRecorder
-	getPod                GetPodFunc
-	getNode               GetNodeFunc
+	podLister             corelisters.PodLister
+	nodeLister            corelisters.NodeLister
 	getPodsAssignedToNode GetPodsByNodeNameFunc
 
 	taintEvictionQueue *TimedWorkerQueue
@@ -110,7 +111,7 @@ func deletePodHandler(c clientset.Interface, emitEventFunc func(types.Namespaced
 		}
 		var err error
 		for i := 0; i < retries; i++ {
-			err = c.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
+			err = addConditionAndDeletePod(ctx, c, name, ns)
 			if err == nil {
 				break
 			}
@@ -118,6 +119,27 @@ func deletePodHandler(c clientset.Interface, emitEventFunc func(types.Namespaced
 		}
 		return err
 	}
+}
+
+func addConditionAndDeletePod(ctx context.Context, c clientset.Interface, name, ns string) (err error) {
+	if feature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) {
+		pod, err := c.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		podApply := corev1apply.Pod(pod.Name, pod.Namespace).WithStatus(corev1apply.PodStatus())
+		podApply.Status.WithConditions(corev1apply.PodCondition().
+			WithType(v1.DisruptionTarget).
+			WithStatus(v1.ConditionTrue).
+			WithReason("DeletionByTaintManager").
+			WithMessage("Taint manager: deleting due to NoExecute taint").
+			WithLastTransitionTime(metav1.Now()),
+		)
+		if _, err := c.CoreV1().Pods(pod.Namespace).ApplyStatus(ctx, podApply, metav1.ApplyOptions{FieldManager: fieldManager, Force: true}); err != nil {
+			return err
+		}
+	}
+	return c.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
 func getNoExecuteTaints(taints []v1.Taint) []v1.Taint {
@@ -156,7 +178,7 @@ func getMinTolerationTime(tolerations []v1.Toleration) time.Duration {
 
 // NewNoExecuteTaintManager creates a new NoExecuteTaintManager that will use passed clientset to
 // communicate with the API server.
-func NewNoExecuteTaintManager(ctx context.Context, c clientset.Interface, getPod GetPodFunc, getNode GetNodeFunc, getPodsAssignedToNode GetPodsByNodeNameFunc) *NoExecuteTaintManager {
+func NewNoExecuteTaintManager(ctx context.Context, c clientset.Interface, podLister corelisters.PodLister, nodeLister corelisters.NodeLister, getPodsAssignedToNode GetPodsByNodeNameFunc) *NoExecuteTaintManager {
 	eventBroadcaster := record.NewBroadcaster()
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "taint-controller"})
 
@@ -164,8 +186,8 @@ func NewNoExecuteTaintManager(ctx context.Context, c clientset.Interface, getPod
 		client:                c,
 		broadcaster:           eventBroadcaster,
 		recorder:              recorder,
-		getPod:                getPod,
-		getNode:               getNode,
+		podLister:             podLister,
+		nodeLister:            nodeLister,
 		getPodsAssignedToNode: getPodsAssignedToNode,
 		taintedNodes:          make(map[string][]v1.Taint),
 
@@ -388,7 +410,7 @@ func (tc *NoExecuteTaintManager) processPodOnNode(
 }
 
 func (tc *NoExecuteTaintManager) handlePodUpdate(ctx context.Context, podUpdate podUpdateItem) {
-	pod, err := tc.getPod(podUpdate.podName, podUpdate.podNamespace)
+	pod, err := tc.podLister.Pods(podUpdate.podNamespace).Get(podUpdate.podName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Delete
@@ -428,7 +450,7 @@ func (tc *NoExecuteTaintManager) handlePodUpdate(ctx context.Context, podUpdate 
 }
 
 func (tc *NoExecuteTaintManager) handleNodeUpdate(ctx context.Context, nodeUpdate nodeUpdateItem) {
-	node, err := tc.getNode(nodeUpdate.nodeName)
+	node, err := tc.nodeLister.Get(nodeUpdate.nodeName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Delete

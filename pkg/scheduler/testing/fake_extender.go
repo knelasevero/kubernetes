@@ -24,6 +24,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
+	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
@@ -50,11 +51,6 @@ func ErrorPredicateExtender(pod *v1.Pod, node *v1.Node) *framework.Status {
 // FalsePredicateExtender implements FitPredicate function to always return unschedulable status.
 func FalsePredicateExtender(pod *v1.Pod, node *v1.Node) *framework.Status {
 	return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("pod is unschedulable on the node %q", node.Name))
-}
-
-// FalseAndUnresolvePredicateExtender implements fitPredicate to always return unschedulable and unresolvable status.
-func FalseAndUnresolvePredicateExtender(pod *v1.Pod, node *v1.Node) *framework.Status {
-	return framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("pod is unschedulable and unresolvable on the node %q", node.Name))
 }
 
 // TruePredicateExtender implements FitPredicate function to always return success status.
@@ -182,6 +178,7 @@ func (f *FakeExtender) SupportsPreemption() bool {
 
 // ProcessPreemption implements the extender preempt function.
 func (f *FakeExtender) ProcessPreemption(
+	logger klog.Logger,
 	pod *v1.Pod,
 	nodeNameToVictims map[string]*extenderv1.Victims,
 	nodeInfos framework.NodeInfoLister,
@@ -199,7 +196,7 @@ func (f *FakeExtender) ProcessPreemption(
 	for nodeName, victims := range nodeNameToVictimsCopy {
 		// Try to do preemption on extender side.
 		nodeInfo, _ := nodeInfos.Get(nodeName)
-		extenderVictimPods, extenderPDBViolations, fits, err := f.selectVictimsOnNodeByExtender(pod, nodeInfo.Node())
+		extenderVictimPods, extenderPDBViolations, fits, err := f.selectVictimsOnNodeByExtender(logger, pod, nodeInfo.Node())
 		if err != nil {
 			return nil, err
 		}
@@ -221,7 +218,7 @@ func (f *FakeExtender) ProcessPreemption(
 // 1. More victim pods (if any) amended by preemption phase of extender.
 // 2. Number of violating victim (used to calculate PDB).
 // 3. Fits or not after preemption phase on extender's side.
-func (f *FakeExtender) selectVictimsOnNodeByExtender(pod *v1.Pod, node *v1.Node) ([]*v1.Pod, int, bool, error) {
+func (f *FakeExtender) selectVictimsOnNodeByExtender(logger klog.Logger, pod *v1.Pod, node *v1.Node) ([]*v1.Pod, int, bool, error) {
 	// If a extender support preemption but have no cached node info, let's run filter to make sure
 	// default scheduler's decision still stand with given pod and node.
 	if !f.NodeCacheCapable {
@@ -242,7 +239,7 @@ func (f *FakeExtender) selectVictimsOnNodeByExtender(pod *v1.Pod, node *v1.Node)
 	var potentialVictims []*v1.Pod
 
 	removePod := func(rp *v1.Pod) {
-		nodeInfoCopy.RemovePod(rp)
+		nodeInfoCopy.RemovePod(logger, rp)
 	}
 	addPod := func(ap *v1.Pod) {
 		nodeInfoCopy.AddPod(ap)

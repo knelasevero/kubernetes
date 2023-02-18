@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2/ktesting"
 )
 
 func TestNewResource(t *testing.T) {
@@ -1081,10 +1082,11 @@ func TestNodeInfoRemovePod(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			logger, _ := ktesting.NewTestContext(t)
 			ni := fakeNodeInfo(pods...)
 
 			gen := ni.Generation
-			err := ni.RemovePod(test.pod)
+			err := ni.RemovePod(logger, test.pod)
 			if err != nil {
 				if test.errExpected {
 					expectedErrorMsg := fmt.Errorf("no corresponding pod %s in pods of node %s", test.pod.Name, ni.Node().Name)
@@ -1369,6 +1371,91 @@ func TestGetNamespacesFromPodAffinityTerm(t *testing.T) {
 			}, test.term)
 			if diff := cmp.Diff(test.want, got); diff != "" {
 				t.Errorf("unexpected diff (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFitError_Error(t *testing.T) {
+	tests := []struct {
+		name          string
+		pod           *v1.Pod
+		numAllNodes   int
+		diagnosis     Diagnosis
+		wantReasonMsg string
+	}{
+		{
+			name:        "nodes failed Prefilter plugin",
+			numAllNodes: 3,
+			diagnosis: Diagnosis{
+				PreFilterMsg: "Node(s) failed PreFilter plugin FalsePreFilter",
+			},
+			wantReasonMsg: "0/3 nodes are available: Node(s) failed PreFilter plugin FalsePreFilter.",
+		},
+		{
+			name:        "nodes failed one Filter plugin with an empty PostFilterMsg",
+			numAllNodes: 3,
+			diagnosis: Diagnosis{
+				PreFilterMsg: "",
+				NodeToStatusMap: NodeToStatusMap{
+					"node1": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node2": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node3": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+				},
+			},
+			wantReasonMsg: "0/3 nodes are available: 3 Node(s) failed Filter plugin FalseFilter-1.",
+		},
+		{
+			name:        "nodes failed one Filter plugin with a non-empty PostFilterMsg",
+			numAllNodes: 3,
+			diagnosis: Diagnosis{
+				PreFilterMsg: "",
+				NodeToStatusMap: NodeToStatusMap{
+					"node1": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node2": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node3": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+				},
+				PostFilterMsg: "Error running PostFilter plugin FailedPostFilter",
+			},
+			wantReasonMsg: "0/3 nodes are available: 3 Node(s) failed Filter plugin FalseFilter-1. Error running PostFilter plugin FailedPostFilter.",
+		},
+		{
+			name:        "nodes failed two Filter plugins with an empty PostFilterMsg",
+			numAllNodes: 3,
+			diagnosis: Diagnosis{
+				PreFilterMsg: "",
+				NodeToStatusMap: NodeToStatusMap{
+					"node1": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node2": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node3": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-2"),
+				},
+			},
+			wantReasonMsg: "0/3 nodes are available: 1 Node(s) failed Filter plugin FalseFilter-2, 2 Node(s) failed Filter plugin FalseFilter-1.",
+		},
+		{
+			name:        "nodes failed two Filter plugins with a non-empty PostFilterMsg",
+			numAllNodes: 3,
+			diagnosis: Diagnosis{
+				PreFilterMsg: "",
+				NodeToStatusMap: NodeToStatusMap{
+					"node1": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node2": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-1"),
+					"node3": NewStatus(Unschedulable, "Node(s) failed Filter plugin FalseFilter-2"),
+				},
+				PostFilterMsg: "Error running PostFilter plugin FailedPostFilter",
+			},
+			wantReasonMsg: "0/3 nodes are available: 1 Node(s) failed Filter plugin FalseFilter-2, 2 Node(s) failed Filter plugin FalseFilter-1. Error running PostFilter plugin FailedPostFilter.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &FitError{
+				Pod:         tt.pod,
+				NumAllNodes: tt.numAllNodes,
+				Diagnosis:   tt.diagnosis,
+			}
+			if gotReasonMsg := f.Error(); gotReasonMsg != tt.wantReasonMsg {
+				t.Errorf("Error() = Got: %v Want: %v", gotReasonMsg, tt.wantReasonMsg)
 			}
 		})
 	}

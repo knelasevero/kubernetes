@@ -24,13 +24,10 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/component-base/featuregate"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	plfeature "k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	plugintesting "k8s.io/kubernetes/pkg/scheduler/framework/plugins/testing"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
@@ -462,6 +459,19 @@ func TestEnoughRequests(t *testing.T) {
 				},
 			},
 		},
+		{
+			pod: newResourcePod(
+				framework.Resource{
+					MilliCPU: 1,
+					Memory:   1,
+					ScalarResources: map[v1.ResourceName]int64{
+						extendedResourceA: 0,
+					}}),
+			nodeInfo: framework.NewNodeInfo(newResourcePod(framework.Resource{
+				MilliCPU: 0, Memory: 0, ScalarResources: map[v1.ResourceName]int64{extendedResourceA: 6}})),
+			name:                      "skip checking extended resource request with quantity zero via resource groups",
+			wantInsufficientResources: []InsufficientResource{},
+		},
 	}
 
 	for _, test := range enoughPodsTests {
@@ -575,7 +585,6 @@ func TestStorageRequests(t *testing.T) {
 		pod        *v1.Pod
 		nodeInfo   *framework.NodeInfo
 		name       string
-		features   map[featuregate.Feature]bool
 		wantStatus *framework.Status
 	}{
 		{
@@ -599,13 +608,10 @@ func TestStorageRequests(t *testing.T) {
 			wantStatus: framework.NewStatus(framework.Unschedulable, getErrReason(v1.ResourceEphemeralStorage)),
 		},
 		{
-			pod: newResourceInitPod(newResourcePod(framework.Resource{EphemeralStorage: 25}), framework.Resource{EphemeralStorage: 25}),
+			pod: newResourceInitPod(newResourcePod(framework.Resource{EphemeralStorage: 5})),
 			nodeInfo: framework.NewNodeInfo(
-				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2})),
-			name: "ephemeral local storage request is ignored due to disabled feature gate",
-			features: map[featuregate.Feature]bool{
-				"LocalStorageCapacityIsolation": false,
-			},
+				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2, EphemeralStorage: 10})),
+			name: "ephemeral local storage is sufficient",
 		},
 		{
 			pod: newResourcePod(framework.Resource{EphemeralStorage: 10}),
@@ -617,9 +623,6 @@ func TestStorageRequests(t *testing.T) {
 
 	for _, test := range storagePodsTests {
 		t.Run(test.name, func(t *testing.T) {
-			for k, v := range test.features {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, k, v)()
-			}
 			node := v1.Node{Status: v1.NodeStatus{Capacity: makeResources(10, 20, 32, 5, 20, 5).Capacity, Allocatable: makeAllocatableResources(10, 20, 32, 5, 20, 5)}}
 			test.nodeInfo.SetNode(&node)
 
@@ -643,11 +646,6 @@ func TestStorageRequests(t *testing.T) {
 }
 
 func TestFitScore(t *testing.T) {
-	defaultResources := []config.ResourceSpec{
-		{Name: string(v1.ResourceCPU), Weight: 1},
-		{Name: string(v1.ResourceMemory), Weight: 1},
-	}
-
 	tests := []struct {
 		name                 string
 		requestedPod         *v1.Pod
@@ -756,9 +754,12 @@ func TestFitScore(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
 			state := framework.NewCycleState()
 			snapshot := cache.NewSnapshot(test.existingPods, test.nodes)
-			fh, _ := runtime.NewFramework(nil, nil, wait.NeverStop, runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := runtime.NewFramework(nil, nil, ctx.Done(), runtime.WithSnapshotSharedLister(snapshot))
 			args := test.nodeResourcesFitArgs
 			p, err := NewFit(&args, fh, plfeature.Features{})
 			if err != nil {
@@ -767,7 +768,7 @@ func TestFitScore(t *testing.T) {
 
 			var gotPriorities framework.NodeScoreList
 			for _, n := range test.nodes {
-				score, status := p.(framework.ScorePlugin).Score(context.Background(), state, test.requestedPod, n.Name)
+				score, status := p.(framework.ScorePlugin).Score(ctx, state, test.requestedPod, n.Name)
 				if !status.IsSuccess() {
 					t.Errorf("unexpected error: %v", status)
 				}
@@ -776,6 +777,118 @@ func TestFitScore(t *testing.T) {
 
 			if !reflect.DeepEqual(test.expectedPriorities, gotPriorities) {
 				t.Errorf("expected:\n\t%+v,\ngot:\n\t%+v", test.expectedPriorities, gotPriorities)
+			}
+		})
+	}
+}
+
+var benchmarkResourceSet = []config.ResourceSpec{
+	{Name: string(v1.ResourceCPU), Weight: 1},
+	{Name: string(v1.ResourceMemory), Weight: 1},
+	{Name: string(v1.ResourcePods), Weight: 1},
+	{Name: string(v1.ResourceStorage), Weight: 1},
+	{Name: string(v1.ResourceEphemeralStorage), Weight: 1},
+	{Name: string(extendedResourceA), Weight: 1},
+	{Name: string(extendedResourceB), Weight: 1},
+	{Name: string(kubernetesIOResourceA), Weight: 1},
+	{Name: string(kubernetesIOResourceB), Weight: 1},
+	{Name: string(hugePageResourceA), Weight: 1},
+}
+
+func BenchmarkTestFitScore(b *testing.B) {
+	tests := []struct {
+		name                 string
+		nodeResourcesFitArgs config.NodeResourcesFitArgs
+	}{
+		{
+			name: "RequestedToCapacityRatio with defaultResources",
+			nodeResourcesFitArgs: config.NodeResourcesFitArgs{
+				ScoringStrategy: &config.ScoringStrategy{
+					Type:      config.RequestedToCapacityRatio,
+					Resources: defaultResources,
+					RequestedToCapacityRatio: &config.RequestedToCapacityRatioParam{
+						Shape: []config.UtilizationShapePoint{
+							{Utilization: 0, Score: 10},
+							{Utilization: 100, Score: 0},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "RequestedToCapacityRatio with 10 resources",
+			nodeResourcesFitArgs: config.NodeResourcesFitArgs{
+				ScoringStrategy: &config.ScoringStrategy{
+					Type:      config.RequestedToCapacityRatio,
+					Resources: benchmarkResourceSet,
+					RequestedToCapacityRatio: &config.RequestedToCapacityRatioParam{
+						Shape: []config.UtilizationShapePoint{
+							{Utilization: 0, Score: 10},
+							{Utilization: 100, Score: 0},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "MostAllocated with defaultResources",
+			nodeResourcesFitArgs: config.NodeResourcesFitArgs{
+				ScoringStrategy: &config.ScoringStrategy{
+					Type:      config.MostAllocated,
+					Resources: defaultResources,
+				},
+			},
+		},
+		{
+			name: "MostAllocated with 10 resources",
+			nodeResourcesFitArgs: config.NodeResourcesFitArgs{
+				ScoringStrategy: &config.ScoringStrategy{
+					Type:      config.MostAllocated,
+					Resources: benchmarkResourceSet,
+				},
+			},
+		},
+		{
+			name: "LeastAllocated with defaultResources",
+			nodeResourcesFitArgs: config.NodeResourcesFitArgs{
+				ScoringStrategy: &config.ScoringStrategy{
+					Type:      config.LeastAllocated,
+					Resources: defaultResources,
+				},
+			},
+		},
+		{
+			name: "LeastAllocated with 10 resources",
+			nodeResourcesFitArgs: config.NodeResourcesFitArgs{
+				ScoringStrategy: &config.ScoringStrategy{
+					Type:      config.LeastAllocated,
+					Resources: benchmarkResourceSet,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		b.Run(test.name, func(b *testing.B) {
+			existingPods := []*v1.Pod{
+				st.MakePod().Node("node1").Req(map[v1.ResourceName]string{"cpu": "2000", "memory": "4000"}).Obj(),
+			}
+			nodes := []*v1.Node{
+				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "4000", "memory": "10000"}).Obj(),
+			}
+			state := framework.NewCycleState()
+			var nodeResourcesFunc = runtime.FactoryAdapter(plfeature.Features{}, NewFit)
+			pl := plugintesting.SetupPlugin(b, nodeResourcesFunc, &test.nodeResourcesFitArgs, cache.NewSnapshot(existingPods, nodes))
+			p := pl.(*Fit)
+
+			b.ResetTimer()
+
+			requestedPod := st.MakePod().Req(map[v1.ResourceName]string{"cpu": "1000", "memory": "2000"}).Obj()
+			for i := 0; i < b.N; i++ {
+				_, status := p.Score(context.Background(), state, requestedPod, nodes[0].Name)
+				if !status.IsSuccess() {
+					b.Errorf("unexpected status: %v", status)
+				}
 			}
 		})
 	}

@@ -23,7 +23,9 @@ import (
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kube-scheduler/config/v1beta2"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/utils/pointer"
 )
@@ -50,6 +52,7 @@ func TestApplyFeatureGates(t *testing.T) {
 						{Name: names.PodTopologySpread},
 						{Name: names.InterPodAffinity},
 						{Name: names.VolumeBinding},
+						{Name: names.VolumeZone},
 						{Name: names.NodeAffinity},
 					},
 				},
@@ -87,13 +90,101 @@ func TestApplyFeatureGates(t *testing.T) {
 				},
 				Score: v1beta2.PluginSet{
 					Enabled: []v1beta2.Plugin{
-						{Name: names.NodeResourcesBalancedAllocation, Weight: pointer.Int32Ptr(1)},
-						{Name: names.ImageLocality, Weight: pointer.Int32Ptr(1)},
-						{Name: names.InterPodAffinity, Weight: pointer.Int32Ptr(1)},
-						{Name: names.NodeResourcesFit, Weight: pointer.Int32Ptr(1)},
-						{Name: names.NodeAffinity, Weight: pointer.Int32Ptr(1)},
-						{Name: names.PodTopologySpread, Weight: pointer.Int32Ptr(2)},
-						{Name: names.TaintToleration, Weight: pointer.Int32Ptr(1)},
+						{Name: names.NodeResourcesBalancedAllocation, Weight: pointer.Int32(1)},
+						{Name: names.ImageLocality, Weight: pointer.Int32(1)},
+						{Name: names.InterPodAffinity, Weight: pointer.Int32(1)},
+						{Name: names.NodeResourcesFit, Weight: pointer.Int32(1)},
+						{Name: names.NodeAffinity, Weight: pointer.Int32(1)},
+						{Name: names.PodTopologySpread, Weight: pointer.Int32(2)},
+						{Name: names.TaintToleration, Weight: pointer.Int32(1)},
+					},
+				},
+				Reserve: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.VolumeBinding},
+					},
+				},
+				PreBind: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.VolumeBinding},
+					},
+				},
+				Bind: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.DefaultBinder},
+					},
+				},
+			},
+		},
+		{
+			name: "Feature gate PodSchedulingReadiness enabled",
+			features: map[featuregate.Feature]bool{
+				features.PodSchedulingReadiness: true,
+			},
+			wantConfig: &v1beta2.Plugins{
+				PreEnqueue: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.SchedulingGates},
+					},
+				},
+				QueueSort: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.PrioritySort},
+					},
+				},
+				PreFilter: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.NodeResourcesFit},
+						{Name: names.NodePorts},
+						{Name: names.VolumeRestrictions},
+						{Name: names.PodTopologySpread},
+						{Name: names.InterPodAffinity},
+						{Name: names.VolumeBinding},
+						{Name: names.VolumeZone},
+						{Name: names.NodeAffinity},
+					},
+				},
+				Filter: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.NodeUnschedulable},
+						{Name: names.NodeName},
+						{Name: names.TaintToleration},
+						{Name: names.NodeAffinity},
+						{Name: names.NodePorts},
+						{Name: names.NodeResourcesFit},
+						{Name: names.VolumeRestrictions},
+						{Name: names.EBSLimits},
+						{Name: names.GCEPDLimits},
+						{Name: names.NodeVolumeLimits},
+						{Name: names.AzureDiskLimits},
+						{Name: names.VolumeBinding},
+						{Name: names.VolumeZone},
+						{Name: names.PodTopologySpread},
+						{Name: names.InterPodAffinity},
+					},
+				},
+				PostFilter: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.DefaultPreemption},
+					},
+				},
+				PreScore: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.InterPodAffinity},
+						{Name: names.PodTopologySpread},
+						{Name: names.TaintToleration},
+						{Name: names.NodeAffinity},
+					},
+				},
+				Score: v1beta2.PluginSet{
+					Enabled: []v1beta2.Plugin{
+						{Name: names.NodeResourcesBalancedAllocation, Weight: pointer.Int32(1)},
+						{Name: names.ImageLocality, Weight: pointer.Int32(1)},
+						{Name: names.InterPodAffinity, Weight: pointer.Int32(1)},
+						{Name: names.NodeResourcesFit, Weight: pointer.Int32(1)},
+						{Name: names.NodeAffinity, Weight: pointer.Int32(1)},
+						{Name: names.PodTopologySpread, Weight: pointer.Int32(2)},
+						{Name: names.TaintToleration, Weight: pointer.Int32(1)},
 					},
 				},
 				Reserve: v1beta2.PluginSet{
@@ -117,11 +208,12 @@ func TestApplyFeatureGates(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			logger, _ := ktesting.NewTestContext(t)
 			for k, v := range test.features {
 				defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, k, v)()
 			}
 
-			gotConfig := getDefaultPlugins()
+			gotConfig := getDefaultPlugins(logger)
 			if diff := cmp.Diff(test.wantConfig, gotConfig); diff != "" {
 				t.Errorf("unexpected config diff (-want, +got): %s", diff)
 			}
@@ -281,8 +373,8 @@ func TestMergePlugins(t *testing.T) {
 			customPlugins: &v1beta2.Plugins{
 				Filter: v1beta2.PluginSet{
 					Enabled: []v1beta2.Plugin{
-						{Name: "Plugin1", Weight: pointer.Int32Ptr(2)},
-						{Name: "Plugin3", Weight: pointer.Int32Ptr(3)},
+						{Name: "Plugin1", Weight: pointer.Int32(2)},
+						{Name: "Plugin3", Weight: pointer.Int32(3)},
 					},
 				},
 			},
@@ -298,9 +390,9 @@ func TestMergePlugins(t *testing.T) {
 			expectedPlugins: &v1beta2.Plugins{
 				Filter: v1beta2.PluginSet{
 					Enabled: []v1beta2.Plugin{
-						{Name: "Plugin1", Weight: pointer.Int32Ptr(2)},
+						{Name: "Plugin1", Weight: pointer.Int32(2)},
 						{Name: "Plugin2"},
-						{Name: "Plugin3", Weight: pointer.Int32Ptr(3)},
+						{Name: "Plugin3", Weight: pointer.Int32(3)},
 					},
 				},
 			},
@@ -310,8 +402,8 @@ func TestMergePlugins(t *testing.T) {
 			customPlugins: &v1beta2.Plugins{
 				Filter: v1beta2.PluginSet{
 					Enabled: []v1beta2.Plugin{
-						{Name: "Plugin2", Weight: pointer.Int32Ptr(2)},
-						{Name: "Plugin1", Weight: pointer.Int32Ptr(1)},
+						{Name: "Plugin2", Weight: pointer.Int32(2)},
+						{Name: "Plugin1", Weight: pointer.Int32(1)},
 					},
 				},
 			},
@@ -327,8 +419,8 @@ func TestMergePlugins(t *testing.T) {
 			expectedPlugins: &v1beta2.Plugins{
 				Filter: v1beta2.PluginSet{
 					Enabled: []v1beta2.Plugin{
-						{Name: "Plugin1", Weight: pointer.Int32Ptr(1)},
-						{Name: "Plugin2", Weight: pointer.Int32Ptr(2)},
+						{Name: "Plugin1", Weight: pointer.Int32(1)},
+						{Name: "Plugin2", Weight: pointer.Int32(2)},
 						{Name: "Plugin3"},
 					},
 				},
@@ -340,9 +432,9 @@ func TestMergePlugins(t *testing.T) {
 				Filter: v1beta2.PluginSet{
 					Enabled: []v1beta2.Plugin{
 						{Name: "Plugin1"},
-						{Name: "Plugin2", Weight: pointer.Int32Ptr(2)},
+						{Name: "Plugin2", Weight: pointer.Int32(2)},
 						{Name: "Plugin3"},
-						{Name: "Plugin2", Weight: pointer.Int32Ptr(4)},
+						{Name: "Plugin2", Weight: pointer.Int32(4)},
 					},
 				},
 			},
@@ -359,9 +451,9 @@ func TestMergePlugins(t *testing.T) {
 				Filter: v1beta2.PluginSet{
 					Enabled: []v1beta2.Plugin{
 						{Name: "Plugin1"},
-						{Name: "Plugin2", Weight: pointer.Int32Ptr(4)},
+						{Name: "Plugin2", Weight: pointer.Int32(4)},
 						{Name: "Plugin3"},
-						{Name: "Plugin2", Weight: pointer.Int32Ptr(2)},
+						{Name: "Plugin2", Weight: pointer.Int32(2)},
 					},
 				},
 			},
@@ -370,7 +462,8 @@ func TestMergePlugins(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			test.defaultPlugins = mergePlugins(test.defaultPlugins, test.customPlugins)
+			logger, _ := ktesting.NewTestContext(t)
+			test.defaultPlugins = mergePlugins(logger, test.defaultPlugins, test.customPlugins)
 			if d := cmp.Diff(test.expectedPlugins, test.defaultPlugins); d != "" {
 				t.Fatalf("plugins mismatch (-want +got):\n%s", d)
 			}

@@ -206,15 +206,15 @@ func (pl *PodTopologySpread) updateWithPod(s *preFilterState, updatedPod, preemp
 		if !constraint.Selector.Matches(podLabelSet) {
 			continue
 		}
+
 		if pl.enableNodeInclusionPolicyInPodTopologySpread &&
-			!constraint.matchNodeInclusionPolicies(updatedPod, node, requiredSchedulingTerm) {
+			!constraint.matchNodeInclusionPolicies(preemptorPod, node, requiredSchedulingTerm) {
 			continue
 		}
 
 		k, v := constraint.TopologyKey, node.Labels[constraint.TopologyKey]
 		pair := topologyPair{key: k, value: v}
 		s.TpPairToMatchNum[pair] += delta
-
 		s.TpKeyToCriticalPaths[k].update(v, s.TpPairToMatchNum[pair])
 	}
 }
@@ -244,11 +244,10 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod)
 	if len(pod.Spec.TopologySpreadConstraints) > 0 {
 		// We have feature gating in APIServer to strip the spec
 		// so don't need to re-check feature gate, just check length of Constraints.
-		constraints, err = filterTopologySpreadConstraints(
+		constraints, err = pl.filterTopologySpreadConstraints(
 			pod.Spec.TopologySpreadConstraints,
+			pod.Labels,
 			v1.DoNotSchedule,
-			pl.enableMinDomainsInPodTopologySpread,
-			pl.enableNodeInclusionPolicyInPodTopologySpread,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("obtaining pod's hard topology spread constraints: %w", err)
@@ -275,7 +274,7 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod)
 		nodeInfo := allNodes[i]
 		node := nodeInfo.Node()
 		if node == nil {
-			klog.ErrorS(nil, "Node not found")
+			klog.FromContext(ctx).Error(nil, "Node not found")
 			return
 		}
 
@@ -305,7 +304,7 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod)
 		}
 		tpCountsByNode[i] = tpCounts
 	}
-	pl.parallelizer.Until(ctx, len(allNodes), processNode)
+	pl.parallelizer.Until(ctx, len(allNodes), processNode, pl.Name())
 
 	for _, tpCounts := range tpCountsByNode {
 		for tp, count := range tpCounts {
@@ -348,12 +347,13 @@ func (pl *PodTopologySpread) Filter(ctx context.Context, cycleState *framework.C
 		return nil
 	}
 
+	logger := klog.FromContext(ctx)
 	podLabelSet := labels.Set(pod.Labels)
 	for _, c := range s.Constraints {
 		tpKey := c.TopologyKey
 		tpVal, ok := node.Labels[c.TopologyKey]
 		if !ok {
-			klog.V(5).InfoS("Node doesn't have required label", "node", klog.KObj(node), "label", tpKey)
+			logger.V(5).Info("Node doesn't have required label", "node", klog.KObj(node), "label", tpKey)
 			return framework.NewStatus(framework.UnschedulableAndUnresolvable, ErrReasonNodeLabelNotMatch)
 		}
 
@@ -361,7 +361,7 @@ func (pl *PodTopologySpread) Filter(ctx context.Context, cycleState *framework.C
 		// 'existing matching num' + 'if self-match (1 or 0)' - 'global minimum' <= 'maxSkew'
 		minMatchNum, err := s.minMatchNum(tpKey, c.MinDomains, pl.enableMinDomainsInPodTopologySpread)
 		if err != nil {
-			klog.ErrorS(err, "Internal error occurred while retrieving value precalculated in PreFilter", "topologyKey", tpKey, "paths", s.TpKeyToCriticalPaths)
+			logger.Error(err, "Internal error occurred while retrieving value precalculated in PreFilter", "topologyKey", tpKey, "paths", s.TpKeyToCriticalPaths)
 			continue
 		}
 
@@ -377,7 +377,7 @@ func (pl *PodTopologySpread) Filter(ctx context.Context, cycleState *framework.C
 		}
 		skew := matchNum + selfMatchNum - minMatchNum
 		if skew > int(c.MaxSkew) {
-			klog.V(5).InfoS("Node failed spreadConstraint: matchNum + selfMatchNum - minMatchNum > maxSkew", "node", klog.KObj(node), "topologyKey", tpKey, "matchNum", matchNum, "selfMatchNum", selfMatchNum, "minMatchNum", minMatchNum, "maxSkew", c.MaxSkew)
+			logger.V(5).Info("Node failed spreadConstraint: matchNum + selfMatchNum - minMatchNum > maxSkew", "node", klog.KObj(node), "topologyKey", tpKey, "matchNum", matchNum, "selfMatchNum", selfMatchNum, "minMatchNum", minMatchNum, "maxSkew", c.MaxSkew)
 			return framework.NewStatus(framework.Unschedulable, ErrReasonConstraintsNotMatch)
 		}
 	}

@@ -17,6 +17,7 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -30,6 +31,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
@@ -207,10 +210,17 @@ func TestAssumePodScheduled(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
-			cache := newCache(time.Second, time.Second, nil)
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, time.Second, time.Second)
 			for _, pod := range tt.pods {
-				if err := cache.AssumePod(pod); err != nil {
+				if err := cache.AssumePod(logger, pod); err != nil {
 					t.Fatalf("AssumePod failed: %v", err)
+				}
+				// pod already in cache so can't be assumed
+				if err := cache.AssumePod(logger, pod); err == nil {
+					t.Error("expected error, no error found")
 				}
 			}
 			n := cache.nodes[nodeName]
@@ -219,7 +229,7 @@ func TestAssumePodScheduled(t *testing.T) {
 			}
 
 			for _, pod := range tt.pods {
-				if err := cache.ForgetPod(pod); err != nil {
+				if err := cache.ForgetPod(logger, pod); err != nil {
 					t.Fatalf("ForgetPod failed: %v", err)
 				}
 				if err := isForgottenFromCache(pod, cache); err != nil {
@@ -236,11 +246,11 @@ type testExpirePodStruct struct {
 	assumedTime time.Time
 }
 
-func assumeAndFinishBinding(cache *cacheImpl, pod *v1.Pod, assumedTime time.Time) error {
-	if err := cache.AssumePod(pod); err != nil {
+func assumeAndFinishBinding(logger klog.Logger, cache *cacheImpl, pod *v1.Pod, assumedTime time.Time) error {
+	if err := cache.AssumePod(logger, pod); err != nil {
 		return err
 	}
-	return cache.finishBinding(pod, assumedTime)
+	return cache.finishBinding(logger, pod, assumedTime)
 }
 
 // TestExpirePod tests that assumed pods will be removed if expired.
@@ -317,26 +327,30 @@ func TestExpirePod(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cache := newCache(tc.ttl, time.Second, nil)
+	for i, tt := range tests {
+		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, tt.ttl, time.Second)
 
-			for _, pod := range tc.pods {
-				if err := cache.AssumePod(pod.pod); err != nil {
+			for _, pod := range tt.pods {
+				if err := cache.AssumePod(logger, pod.pod); err != nil {
+
 					t.Fatal(err)
 				}
 				if !pod.finishBind {
 					continue
 				}
-				if err := cache.finishBinding(pod.pod, pod.assumedTime); err != nil {
+				if err := cache.finishBinding(logger, pod.pod, pod.assumedTime); err != nil {
 					t.Fatal(err)
 				}
 			}
 			// pods that got bound and have assumedTime + ttl < cleanupTime will get
 			// expired and removed
-			cache.cleanupAssumedPods(tc.cleanupTime)
+			cache.cleanupAssumedPods(logger, tt.cleanupTime)
 			n := cache.nodes[nodeName]
-			if err := deepEqualWithoutGeneration(n, tc.wNodeInfo); err != nil {
+			if err := deepEqualWithoutGeneration(n, tt.wNodeInfo); err != nil {
 				t.Error(err)
 			}
 		})
@@ -379,18 +393,25 @@ func TestAddPodWillConfirm(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
-			cache := newCache(ttl, time.Second, nil)
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, ttl, time.Second)
 			for _, podToAssume := range tt.podsToAssume {
-				if err := assumeAndFinishBinding(cache, podToAssume, now); err != nil {
+				if err := assumeAndFinishBinding(logger, cache, podToAssume, now); err != nil {
 					t.Fatalf("assumePod failed: %v", err)
 				}
 			}
 			for _, podToAdd := range tt.podsToAdd {
-				if err := cache.AddPod(podToAdd); err != nil {
+				if err := cache.AddPod(logger, podToAdd); err != nil {
 					t.Fatalf("AddPod failed: %v", err)
 				}
+				// pod already in added state
+				if err := cache.AddPod(logger, podToAdd); err == nil {
+					t.Error("expected error, no error found")
+				}
 			}
-			cache.cleanupAssumedPods(now.Add(2 * ttl))
+			cache.cleanupAssumedPods(logger, now.Add(2*ttl))
 			// check after expiration. confirmed pods shouldn't be expired.
 			n := cache.nodes[nodeName]
 			if err := deepEqualWithoutGeneration(n, tt.wNodeInfo); err != nil {
@@ -419,14 +440,17 @@ func TestDump(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
-			cache := newCache(ttl, time.Second, nil)
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, ttl, time.Second)
 			for _, podToAssume := range tt.podsToAssume {
-				if err := assumeAndFinishBinding(cache, podToAssume, now); err != nil {
+				if err := assumeAndFinishBinding(logger, cache, podToAssume, now); err != nil {
 					t.Errorf("assumePod failed: %v", err)
 				}
 			}
 			for _, podToAdd := range tt.podsToAdd {
-				if err := cache.AddPod(podToAdd); err != nil {
+				if err := cache.AddPod(logger, podToAdd); err != nil {
 					t.Errorf("AddPod failed: %v", err)
 				}
 			}
@@ -443,6 +467,71 @@ func TestDump(t *testing.T) {
 			}
 			if !reflect.DeepEqual(snapshot.AssumedPods, cache.assumedPods) {
 				t.Errorf("expect \n%+v; got \n%+v", cache.assumedPods, snapshot.AssumedPods)
+			}
+		})
+	}
+}
+
+// TestAddPodAlwaysUpdatePodInfoInNodeInfo tests that AddPod method always updates PodInfo in NodeInfo,
+// even when the Pod is assumed one.
+func TestAddPodAlwaysUpdatesPodInfoInNodeInfo(t *testing.T) {
+	ttl := 10 * time.Second
+	logger, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	now := time.Now()
+	p1 := makeBasePod(t, "node1", "test-1", "100m", "500", "", []v1.ContainerPort{{HostPort: 80}})
+
+	p2 := p1.DeepCopy()
+	p2.Status.Conditions = append(p1.Status.Conditions, v1.PodCondition{
+		Type:   v1.PodScheduled,
+		Status: v1.ConditionTrue,
+	})
+
+	tests := []struct {
+		podsToAssume         []*v1.Pod
+		podsToAddAfterAssume []*v1.Pod
+		nodeInfo             map[string]*framework.NodeInfo
+	}{
+		{
+			podsToAssume:         []*v1.Pod{p1},
+			podsToAddAfterAssume: []*v1.Pod{p2},
+			nodeInfo: map[string]*framework.NodeInfo{
+				"node1": newNodeInfo(
+					&framework.Resource{
+						MilliCPU: 100,
+						Memory:   500,
+					},
+					&framework.Resource{
+						MilliCPU: 100,
+						Memory:   500,
+					},
+					[]*v1.Pod{p2},
+					newHostPortInfoBuilder().add("TCP", "0.0.0.0", 80).build(),
+					make(map[string]*framework.ImageStateSummary),
+				),
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			cache := newCache(ctx, ttl, time.Second)
+			for _, podToAssume := range tt.podsToAssume {
+				if err := assumeAndFinishBinding(logger, cache, podToAssume, now); err != nil {
+					t.Fatalf("assumePod failed: %v", err)
+				}
+			}
+			for _, podToAdd := range tt.podsToAddAfterAssume {
+				if err := cache.AddPod(logger, podToAdd); err != nil {
+					t.Fatalf("AddPod failed: %v", err)
+				}
+			}
+			for nodeName, expected := range tt.nodeInfo {
+				n := cache.nodes[nodeName]
+				if err := deepEqualWithoutGeneration(n, expected); err != nil {
+					t.Errorf("node %q: %v", nodeName, err)
+				}
 			}
 		})
 	}
@@ -487,19 +576,22 @@ func TestAddPodWillReplaceAssumed(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
-			cache := newCache(ttl, time.Second, nil)
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, ttl, time.Second)
 			for _, podToAssume := range tt.podsToAssume {
-				if err := assumeAndFinishBinding(cache, podToAssume, now); err != nil {
+				if err := assumeAndFinishBinding(logger, cache, podToAssume, now); err != nil {
 					t.Fatalf("assumePod failed: %v", err)
 				}
 			}
 			for _, podToAdd := range tt.podsToAdd {
-				if err := cache.AddPod(podToAdd); err != nil {
+				if err := cache.AddPod(logger, podToAdd); err != nil {
 					t.Fatalf("AddPod failed: %v", err)
 				}
 			}
 			for _, podToUpdate := range tt.podsToUpdate {
-				if err := cache.UpdatePod(podToUpdate[0], podToUpdate[1]); err != nil {
+				if err := cache.UpdatePod(logger, podToUpdate[0], podToUpdate[1]); err != nil {
 					t.Fatalf("UpdatePod failed: %v", err)
 				}
 			}
@@ -541,17 +633,20 @@ func TestAddPodAfterExpiration(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
 			now := time.Now()
-			cache := newCache(ttl, time.Second, nil)
-			if err := assumeAndFinishBinding(cache, tt.pod, now); err != nil {
+			cache := newCache(ctx, ttl, time.Second)
+			if err := assumeAndFinishBinding(logger, cache, tt.pod, now); err != nil {
 				t.Fatalf("assumePod failed: %v", err)
 			}
-			cache.cleanupAssumedPods(now.Add(2 * ttl))
+			cache.cleanupAssumedPods(logger, now.Add(2*ttl))
 			// It should be expired and removed.
 			if err := isForgottenFromCache(tt.pod, cache); err != nil {
 				t.Error(err)
 			}
-			if err := cache.AddPod(tt.pod); err != nil {
+			if err := cache.AddPod(logger, tt.pod); err != nil {
 				t.Fatalf("AddPod failed: %v", err)
 			}
 			// check after expiration. confirmed pods shouldn't be expired.
@@ -608,9 +703,12 @@ func TestUpdatePod(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
-			cache := newCache(ttl, time.Second, nil)
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, ttl, time.Second)
 			for _, podToAdd := range tt.podsToAdd {
-				if err := cache.AddPod(podToAdd); err != nil {
+				if err := cache.AddPod(logger, podToAdd); err != nil {
 					t.Fatalf("AddPod failed: %v", err)
 				}
 			}
@@ -619,7 +717,7 @@ func TestUpdatePod(t *testing.T) {
 				if j == 0 {
 					continue
 				}
-				if err := cache.UpdatePod(tt.podsToUpdate[j-1], tt.podsToUpdate[j]); err != nil {
+				if err := cache.UpdatePod(logger, tt.podsToUpdate[j-1], tt.podsToUpdate[j]); err != nil {
 					t.Fatalf("UpdatePod failed: %v", err)
 				}
 				// check after expiration. confirmed pods shouldn't be expired.
@@ -644,7 +742,7 @@ func TestUpdatePodAndGet(t *testing.T) {
 		pod *v1.Pod
 
 		podToUpdate *v1.Pod
-		handler     func(cache Cache, pod *v1.Pod) error
+		handler     func(logger klog.Logger, cache Cache, pod *v1.Pod) error
 
 		assumePod bool
 	}{
@@ -652,8 +750,8 @@ func TestUpdatePodAndGet(t *testing.T) {
 			pod: testPods[0],
 
 			podToUpdate: testPods[0],
-			handler: func(cache Cache, pod *v1.Pod) error {
-				return cache.AssumePod(pod)
+			handler: func(logger klog.Logger, cache Cache, pod *v1.Pod) error {
+				return cache.AssumePod(logger, pod)
 			},
 			assumePod: true,
 		},
@@ -661,8 +759,8 @@ func TestUpdatePodAndGet(t *testing.T) {
 			pod: testPods[0],
 
 			podToUpdate: testPods[1],
-			handler: func(cache Cache, pod *v1.Pod) error {
-				return cache.AddPod(pod)
+			handler: func(logger klog.Logger, cache Cache, pod *v1.Pod) error {
+				return cache.AddPod(logger, pod)
 			},
 			assumePod: false,
 		},
@@ -670,14 +768,28 @@ func TestUpdatePodAndGet(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
-			cache := newCache(ttl, time.Second, nil)
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, ttl, time.Second)
+			// trying to get an unknown pod should return an error
+			// podToUpdate has not been added yet
+			if _, err := cache.GetPod(tt.podToUpdate); err == nil {
+				t.Error("expected error, no error found")
+			}
 
-			if err := tt.handler(cache, tt.pod); err != nil {
+			// trying to update an unknown pod should return an error
+			// pod has not been added yet
+			if err := cache.UpdatePod(logger, tt.pod, tt.podToUpdate); err == nil {
+				t.Error("expected error, no error found")
+			}
+
+			if err := tt.handler(logger, cache, tt.pod); err != nil {
 				t.Fatalf("unexpected err: %v", err)
 			}
 
 			if !tt.assumePod {
-				if err := cache.UpdatePod(tt.pod, tt.podToUpdate); err != nil {
+				if err := cache.UpdatePod(logger, tt.pod, tt.podToUpdate); err != nil {
 					t.Fatalf("UpdatePod failed: %v", err)
 				}
 			}
@@ -740,17 +852,20 @@ func TestExpireAddUpdatePod(t *testing.T) {
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
 			now := time.Now()
-			cache := newCache(ttl, time.Second, nil)
+			cache := newCache(ctx, ttl, time.Second)
 			for _, podToAssume := range tt.podsToAssume {
-				if err := assumeAndFinishBinding(cache, podToAssume, now); err != nil {
+				if err := assumeAndFinishBinding(logger, cache, podToAssume, now); err != nil {
 					t.Fatalf("assumePod failed: %v", err)
 				}
 			}
-			cache.cleanupAssumedPods(now.Add(2 * ttl))
+			cache.cleanupAssumedPods(logger, now.Add(2*ttl))
 
 			for _, podToAdd := range tt.podsToAdd {
-				if err := cache.AddPod(podToAdd); err != nil {
+				if err := cache.AddPod(logger, podToAdd); err != nil {
 					t.Fatalf("AddPod failed: %v", err)
 				}
 			}
@@ -759,7 +874,7 @@ func TestExpireAddUpdatePod(t *testing.T) {
 				if j == 0 {
 					continue
 				}
-				if err := cache.UpdatePod(tt.podsToUpdate[j-1], tt.podsToUpdate[j]); err != nil {
+				if err := cache.UpdatePod(logger, tt.podsToUpdate[j-1], tt.podsToUpdate[j]); err != nil {
 					t.Fatalf("UpdatePod failed: %v", err)
 				}
 				// check after expiration. confirmed pods shouldn't be expired.
@@ -805,8 +920,11 @@ func TestEphemeralStorageResource(t *testing.T) {
 	}
 	for i, tt := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
-			cache := newCache(time.Second, time.Second, nil)
-			if err := cache.AddPod(tt.pod); err != nil {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache := newCache(ctx, time.Second, time.Second)
+			if err := cache.AddPod(logger, tt.pod); err != nil {
 				t.Fatalf("AddPod failed: %v", err)
 			}
 			n := cache.nodes[nodeName]
@@ -814,7 +932,7 @@ func TestEphemeralStorageResource(t *testing.T) {
 				t.Error(err)
 			}
 
-			if err := cache.RemovePod(tt.pod); err != nil {
+			if err := cache.RemovePod(logger, tt.pod); err != nil {
 				t.Fatalf("RemovePod failed: %v", err)
 			}
 			if _, err := cache.GetPod(tt.pod); err == nil {
@@ -857,15 +975,18 @@ func TestRemovePod(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
 			nodeName := pod.Spec.NodeName
-			cache := newCache(time.Second, time.Second, nil)
+			cache := newCache(ctx, time.Second, time.Second)
 			// Add/Assume pod succeeds even before adding the nodes.
 			if tt.assume {
-				if err := cache.AddPod(pod); err != nil {
+				if err := cache.AddPod(logger, pod); err != nil {
 					t.Fatalf("AddPod failed: %v", err)
 				}
 			} else {
-				if err := cache.AssumePod(pod); err != nil {
+				if err := cache.AssumePod(logger, pod); err != nil {
 					t.Fatalf("AssumePod failed: %v", err)
 				}
 			}
@@ -874,15 +995,20 @@ func TestRemovePod(t *testing.T) {
 				t.Error(err)
 			}
 			for _, n := range nodes {
-				cache.AddNode(n)
+				cache.AddNode(logger, n)
 			}
 
-			if err := cache.RemovePod(pod); err != nil {
+			if err := cache.RemovePod(logger, pod); err != nil {
 				t.Fatalf("RemovePod failed: %v", err)
 			}
 
 			if _, err := cache.GetPod(pod); err == nil {
 				t.Errorf("pod was not deleted")
+			}
+
+			// trying to remove a pod already removed should return an error
+			if err := cache.RemovePod(logger, pod); err == nil {
+				t.Error("expected error, no error found")
 			}
 
 			// Node that owned the Pod should be at the head of the list.
@@ -899,10 +1025,13 @@ func TestForgetPod(t *testing.T) {
 	pods := []*v1.Pod{basePod}
 	now := time.Now()
 	ttl := 10 * time.Second
+	logger, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	cache := newCache(ttl, time.Second, nil)
+	cache := newCache(ctx, ttl, time.Second)
 	for _, pod := range pods {
-		if err := assumeAndFinishBinding(cache, pod, now); err != nil {
+		if err := assumeAndFinishBinding(logger, cache, pod, now); err != nil {
 			t.Fatalf("assumePod failed: %v", err)
 		}
 		isAssumed, err := cache.IsAssumedPod(pod)
@@ -924,11 +1053,15 @@ func TestForgetPod(t *testing.T) {
 		}
 	}
 	for _, pod := range pods {
-		if err := cache.ForgetPod(pod); err != nil {
+		if err := cache.ForgetPod(logger, pod); err != nil {
 			t.Fatalf("ForgetPod failed: %v", err)
 		}
 		if err := isForgottenFromCache(pod, cache); err != nil {
 			t.Errorf("pod %q: %v", pod.Name, err)
+		}
+		// trying to forget a pod already forgotten should return an error
+		if err := cache.ForgetPod(logger, pod); err == nil {
+			t.Error("expected error, no error found")
 		}
 	}
 }
@@ -1079,13 +1212,16 @@ func TestNodeOperators(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
 			expected := buildNodeInfo(test.node, test.pods)
 			node := test.node
 
-			cache := newCache(time.Second, time.Second, nil)
-			cache.AddNode(node)
+			cache := newCache(ctx, time.Second, time.Second)
+			cache.AddNode(logger, node)
 			for _, pod := range test.pods {
-				if err := cache.AddPod(pod); err != nil {
+				if err := cache.AddPod(logger, pod); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1111,7 +1247,7 @@ func TestNodeOperators(t *testing.T) {
 
 			// Step 2: dump cached nodes successfully.
 			cachedNodes := NewEmptySnapshot()
-			if err := cache.UpdateSnapshot(cachedNodes); err != nil {
+			if err := cache.UpdateSnapshot(logger, cachedNodes); err != nil {
 				t.Error(err)
 			}
 			newNode, found := cachedNodes.nodeInfoMap[node.Name]
@@ -1127,7 +1263,7 @@ func TestNodeOperators(t *testing.T) {
 			node.Status.Allocatable[v1.ResourceMemory] = mem50m
 			expected.Allocatable.Memory = mem50m.Value()
 
-			cache.UpdateNode(nil, node)
+			cache.UpdateNode(logger, nil, node)
 			got, found = cache.nodes[node.Name]
 			if !found {
 				t.Errorf("Failed to find node %v in schedulertypes after UpdateNode.", node.Name)
@@ -1150,7 +1286,7 @@ func TestNodeOperators(t *testing.T) {
 			}
 
 			// Step 4: the node can be removed even if it still has pods.
-			if err := cache.RemoveNode(node); err != nil {
+			if err := cache.RemoveNode(logger, node); err != nil {
 				t.Error(err)
 			}
 			if n, err := cache.getNodeInfo(node.Name); err != nil {
@@ -1158,6 +1294,12 @@ func TestNodeOperators(t *testing.T) {
 			} else if n != nil {
 				t.Errorf("The node object for %v should be nil", node.Name)
 			}
+
+			// trying to remove a node already removed should return an error
+			if err := cache.RemoveNode(logger, node); err == nil {
+				t.Error("expected error, no error found")
+			}
+
 			// Check node is removed from nodeTree as well.
 			nodesList, err = cache.nodeTree.list()
 			if err != nil {
@@ -1175,7 +1317,7 @@ func TestNodeOperators(t *testing.T) {
 
 			// Step 5: removing pods for the removed node still succeeds.
 			for _, p := range test.pods {
-				if err := cache.RemovePod(p); err != nil {
+				if err := cache.RemovePod(logger, p); err != nil {
 					t.Error(err)
 				}
 				if _, err := cache.GetPod(p); err == nil {
@@ -1187,6 +1329,8 @@ func TestNodeOperators(t *testing.T) {
 }
 
 func TestSchedulerCache_UpdateSnapshot(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+
 	// Create a few nodes to be used in tests.
 	var nodes []*v1.Node
 	for i := 0; i < 10; i++ {
@@ -1253,73 +1397,73 @@ func TestSchedulerCache_UpdateSnapshot(t *testing.T) {
 
 	addNode := func(i int) operation {
 		return func(t *testing.T) {
-			cache.AddNode(nodes[i])
+			cache.AddNode(logger, nodes[i])
 		}
 	}
 	removeNode := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.RemoveNode(nodes[i]); err != nil {
+			if err := cache.RemoveNode(logger, nodes[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	updateNode := func(i int) operation {
 		return func(t *testing.T) {
-			cache.UpdateNode(nodes[i], updatedNodes[i])
+			cache.UpdateNode(logger, nodes[i], updatedNodes[i])
 		}
 	}
 	addPod := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.AddPod(pods[i]); err != nil {
+			if err := cache.AddPod(logger, pods[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	addPodWithAffinity := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.AddPod(podsWithAffinity[i]); err != nil {
+			if err := cache.AddPod(logger, podsWithAffinity[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	addPodWithPVC := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.AddPod(podsWithPVC[i]); err != nil {
+			if err := cache.AddPod(logger, podsWithPVC[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	removePod := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.RemovePod(pods[i]); err != nil {
+			if err := cache.RemovePod(logger, pods[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	removePodWithAffinity := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.RemovePod(podsWithAffinity[i]); err != nil {
+			if err := cache.RemovePod(logger, podsWithAffinity[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	removePodWithPVC := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.RemovePod(podsWithPVC[i]); err != nil {
+			if err := cache.RemovePod(logger, podsWithPVC[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	updatePod := func(i int) operation {
 		return func(t *testing.T) {
-			if err := cache.UpdatePod(pods[i], updatedPods[i]); err != nil {
+			if err := cache.UpdatePod(logger, pods[i], updatedPods[i]); err != nil {
 				t.Error(err)
 			}
 		}
 	}
 	updateSnapshot := func() operation {
 		return func(t *testing.T) {
-			cache.UpdateSnapshot(snapshot)
+			cache.UpdateSnapshot(logger, snapshot)
 			if err := compareCacheWithNodeInfoSnapshot(t, cache, snapshot); err != nil {
 				t.Error(err)
 			}
@@ -1541,7 +1685,10 @@ func TestSchedulerCache_UpdateSnapshot(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cache = newCache(time.Second, time.Second, nil)
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache = newCache(ctx, time.Second, time.Second)
 			snapshot = NewEmptySnapshot()
 
 			for _, op := range test.operations {
@@ -1575,7 +1722,7 @@ func TestSchedulerCache_UpdateSnapshot(t *testing.T) {
 			}
 
 			// Always update the snapshot at the end of operations and compare it.
-			if err := cache.UpdateSnapshot(snapshot); err != nil {
+			if err := cache.UpdateSnapshot(logger, snapshot); err != nil {
 				t.Error(err)
 			}
 			if err := compareCacheWithNodeInfoSnapshot(t, cache, snapshot); err != nil {
@@ -1650,6 +1797,8 @@ func compareCacheWithNodeInfoSnapshot(t *testing.T, cache *cacheImpl, snapshot *
 }
 
 func TestSchedulerCache_updateNodeInfoSnapshotList(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+
 	// Create a few nodes to be used in tests.
 	var nodes []*v1.Node
 	i := 0
@@ -1673,7 +1822,7 @@ func TestSchedulerCache_updateNodeInfoSnapshotList(t *testing.T) {
 	var snapshot *Snapshot
 
 	addNode := func(t *testing.T, i int) {
-		cache.AddNode(nodes[i])
+		cache.AddNode(logger, nodes[i])
 		_, ok := snapshot.nodeInfoMap[nodes[i].Name]
 		if !ok {
 			snapshot.nodeInfoMap[nodes[i].Name] = cache.nodes[nodes[i].Name].info
@@ -1681,7 +1830,7 @@ func TestSchedulerCache_updateNodeInfoSnapshotList(t *testing.T) {
 	}
 
 	updateSnapshot := func(t *testing.T) {
-		cache.updateNodeInfoSnapshotList(snapshot, true)
+		cache.updateNodeInfoSnapshotList(logger, snapshot, true)
 		if err := compareCacheWithNodeInfoSnapshot(t, cache, snapshot); err != nil {
 			t.Error(err)
 		}
@@ -1771,13 +1920,16 @@ func TestSchedulerCache_updateNodeInfoSnapshotList(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cache = newCache(time.Second, time.Second, nil)
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			cache = newCache(ctx, time.Second, time.Second)
 			snapshot = NewEmptySnapshot()
 
 			test.operations(t)
 
 			// Always update the snapshot at the end of operations and compare it.
-			cache.updateNodeInfoSnapshotList(snapshot, true)
+			cache.updateNodeInfoSnapshotList(logger, snapshot, true)
 			if err := compareCacheWithNodeInfoSnapshot(t, cache, snapshot); err != nil {
 				t.Error(err)
 			}
@@ -1793,11 +1945,12 @@ func TestSchedulerCache_updateNodeInfoSnapshotList(t *testing.T) {
 }
 
 func BenchmarkUpdate1kNodes30kPods(b *testing.B) {
+	logger, _ := ktesting.NewTestContext(b)
 	cache := setupCacheOf1kNodes30kPods(b)
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		cachedNodes := NewEmptySnapshot()
-		cache.UpdateSnapshot(cachedNodes)
+		cache.UpdateSnapshot(logger, cachedNodes)
 	}
 }
 
@@ -1816,12 +1969,13 @@ func BenchmarkExpirePods(b *testing.B) {
 }
 
 func benchmarkExpire(b *testing.B, podNum int) {
+	logger, _ := ktesting.NewTestContext(b)
 	now := time.Now()
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
 		cache := setupCacheWithAssumedPods(b, podNum, now)
 		b.StartTimer()
-		cache.cleanupAssumedPods(now.Add(2 * time.Second))
+		cache.cleanupAssumedPods(logger, now.Add(2*time.Second))
 	}
 }
 
@@ -1850,14 +2004,17 @@ func makeBasePod(t testingMode, nodeName, objName, cpu, mem, extended string, po
 }
 
 func setupCacheOf1kNodes30kPods(b *testing.B) Cache {
-	cache := newCache(time.Second, time.Second, nil)
+	logger, ctx := ktesting.NewTestContext(b)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cache := newCache(ctx, time.Second, time.Second)
 	for i := 0; i < 1000; i++ {
 		nodeName := fmt.Sprintf("node-%d", i)
 		for j := 0; j < 30; j++ {
 			objName := fmt.Sprintf("%s-pod-%d", nodeName, j)
 			pod := makeBasePod(b, nodeName, objName, "0", "0", "", nil)
 
-			if err := cache.AddPod(pod); err != nil {
+			if err := cache.AddPod(logger, pod); err != nil {
 				b.Fatalf("AddPod failed: %v", err)
 			}
 		}
@@ -1866,13 +2023,16 @@ func setupCacheOf1kNodes30kPods(b *testing.B) Cache {
 }
 
 func setupCacheWithAssumedPods(b *testing.B, podNum int, assumedTime time.Time) *cacheImpl {
-	cache := newCache(time.Second, time.Second, nil)
+	logger, ctx := ktesting.NewTestContext(b)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cache := newCache(ctx, time.Second, time.Second)
 	for i := 0; i < podNum; i++ {
 		nodeName := fmt.Sprintf("node-%d", i/10)
 		objName := fmt.Sprintf("%s-pod-%d", nodeName, i%10)
 		pod := makeBasePod(b, nodeName, objName, "0", "0", "", nil)
 
-		err := assumeAndFinishBinding(cache, pod, assumedTime)
+		err := assumeAndFinishBinding(logger, cache, pod, assumedTime)
 		if err != nil {
 			b.Fatalf("assumePod failed: %v", err)
 		}
