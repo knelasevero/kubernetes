@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
@@ -606,7 +607,7 @@ func getOnDeleteRevision(
 	revisions []*apps.ControllerRevision,
 	pods []*v1.Pod,
 ) *apps.ControllerRevision {
-	revisionsToCheck := map[string]interface{}{}
+	revisionsToCheck := sets.New[string]()
 
 	for _, pod := range pods {
 		if !isTerminating(pod) {
@@ -618,7 +619,7 @@ func getOnDeleteRevision(
 				return nil
 			}
 			if podRevision != set.Status.UpdateRevision {
-				revisionsToCheck[podRevision] = nil
+				revisionsToCheck[podRevision] = sets.Empty{}
 			}
 		}
 	}
