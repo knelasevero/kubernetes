@@ -820,10 +820,10 @@ func runForOnDeletePodScenarios(t *testing.T,
 		},
 		{
 			//Test case: unsorted pods
-			name:      "StableRevisionUnsortedPods",
-			expected:  revisionNumberSetPodRevision[0].revision,
-			set:       revisionNumberSetPodRevision[0].set,
-			pods:      []*v1.Pod{
+			name:     "StableRevisionUnsortedPods",
+			expected: revisionNumberSetPodRevision[0].revision,
+			set:      revisionNumberSetPodRevision[0].set,
+			pods: []*v1.Pod{
 				revisionNumberSetPodRevision[0].pods[1],
 				revisionNumberSetPodRevision[0].pods[2],
 				revisionNumberSetPodRevision[0].pods[0],
