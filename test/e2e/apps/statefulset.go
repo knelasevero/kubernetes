@@ -45,6 +45,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+
+	applyconfigsappsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	watchtools "k8s.io/client-go/tools/watch"
@@ -1265,6 +1267,104 @@ var _ = SIGDescribe("StatefulSet", func() {
 		if !strings.Contains(out, "availableReplicas: 2") {
 			framework.Failf("invalid number of availableReplicas: expected=%v received=%v", 2, out)
 		}
+	})
+
+	ginkgo.Describe("StatefulSet Scaling down with podManagementPolicy=OrderedReady should terminate immediately", func() {
+		ss := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nginx-roll",
+				Namespace: ns,
+			},
+			Spec: appsv1.StatefulSetSpec{
+				Replicas:            pointer.Int32Ptr(2),
+				MinReadySeconds:     30,
+				PodManagementPolicy: appsv1.OrderedReadyPodManagement,
+				UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
+				Selector:            &metav1.LabelSelector{MatchLabels: map[string]string{"app": "nginx-roll"}},
+				Template: v1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "nginx-roll"}},
+					Spec: v1.PodSpec{
+						Containers: []v1.Container{{
+							Name:  "nginx",
+							Image: "ghcr.io/nginxinc/nginx-unprivileged:latest",
+							Ports: []v1.ContainerPort{{ContainerPort: 80, Name: "web"}},
+						}},
+					},
+				},
+			},
+		}
+
+		ginkgo.It("Terminates immediately with an apply operation", ginkgo.Focus, func(ctx context.Context) {
+			// Set up the StatefulSet with 2 replicas and specific configuration
+			ss, err := c.AppsV1().StatefulSets(ns).Create(ctx, ss, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			pods := e2estatefulset.GetPodList(ctx, c, ss)
+
+			// check if pods lentgh is bigger than 1 with a timeout of 5 minutes
+			gomega.Eventually(func() int {
+				pods = e2estatefulset.GetPodList(ctx, c, ss)
+				return len(pods.Items)
+			}, 2*time.Minute, 5*time.Second).Should(gomega.BeNumerically(">", 1))
+
+			// Wait for the 2nd pod to become ready
+			ss, _ = e2estatefulset.WaitForPodReady(ctx, c, ss, pods.Items[1].Name)
+			applyconfigs := applyconfigsappsv1.StatefulSet(ss.Name, ss.Namespace)
+
+			// Scale down the StatefulSet
+			applyconfigs.Spec = applyconfigsappsv1.StatefulSetSpec()
+			applyconfigs.Spec.Replicas = pointer.Int32Ptr(1)
+			ss, err = c.AppsV1().StatefulSets(ns).Apply(ctx, applyconfigs, metav1.ApplyOptions{})
+
+			// Fetch updated list of pods after scaling down
+			pods = e2estatefulset.GetPodList(ctx, c, ss)
+
+			// Check that the 2nd pod begins terminating immediately
+			gomega.Expect(len(pods.Items)).To(gomega.Equal(1), "Expected 1 pod, got %d", len(pods.Items))
+
+			// Check if the pod termination starts immediately by observing the deletion timestamp
+			for _, pod := range pods.Items {
+				if pod.Name == "nginx-roll-1" {
+					gomega.Expect(pod.ObjectMeta.DeletionTimestamp).ToNot(gomega.BeNil(), "Pod is not terminating immediately as expected")
+				}
+			}
+
+		})
+
+		ginkgo.It("Terminate immediately with a scale operation", ginkgo.Focus, func(ctx context.Context) {
+			// Set up the StatefulSet with 2 replicas and specific configuration
+			ss, err := c.AppsV1().StatefulSets(ns).Create(ctx, ss, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			pods := e2estatefulset.GetPodList(ctx, c, ss)
+
+			// check if pods lentgh is bigger than 1 with a timeout of 5 minutes
+			gomega.Eventually(func() int {
+				pods = e2estatefulset.GetPodList(ctx, c, ss)
+				return len(pods.Items)
+			}, 2*time.Minute, 5*time.Second).Should(gomega.BeNumerically(">", 1))
+
+			// Wait for the 2nd pod to become ready
+			ss, _ = e2estatefulset.WaitForPodReady(ctx, c, ss, pods.Items[1].Name)
+
+			// right after it, scale down with scale operation
+			ginkgo.By("Scaling stateful set " + ss.Name + " to one replica")
+			ss, err = e2estatefulset.Scale(ctx, c, ss, 1)
+			framework.ExpectNoError(err)
+
+			// Fetch updated list of pods after scaling down
+			ginkgo.By("Fetching updated list of pods after scaling down")
+			pods = e2estatefulset.GetPodList(ctx, c, ss)
+
+			// Check that the 2nd pod begins terminating immediately
+			gomega.Expect(len(pods.Items)).To(gomega.Equal(1), "Expected 1 pod, got %d", len(pods.Items))
+
+			// Check if the pod termination starts immediately by observing the deletion timestamp
+			for _, pod := range pods.Items {
+				if pod.Name == "nginx-roll-1" {
+					gomega.Expect(pod.ObjectMeta.DeletionTimestamp).ToNot(gomega.BeNil(), "Pod is not terminating immediately as expected")
+				}
+			}
+
+		})
 	})
 
 	ginkgo.Describe("Non-retain StatefulSetPersistentVolumeClaimPolicy", func() {
